@@ -44,8 +44,8 @@ perf.data
 perf.data.old
 callgrind.out.*
 vgcore.*
-core
-core.*
+/core
+core.[0-9]*
 
 # Python
 __pycache__/
