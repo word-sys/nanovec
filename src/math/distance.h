@@ -15,6 +15,8 @@ float nanovec_dist_dot_avx2(const float *a, const float *b, uint32_t dim);
 float nanovec_dist_cosine_avx2(const float *a, const float *b, uint32_t dim);
 
 float nanovec_dist_l2_avx512(const float *a, const float *b, uint32_t dim);
+float nanovec_dist_dot_avx512(const float *a, const float *b, uint32_t dim);
+float nanovec_dist_cosine_avx512(const float *a, const float *b, uint32_t dim);
 #endif
 
 #endif /* NANOVEC_MATH_DISTANCE_H */
