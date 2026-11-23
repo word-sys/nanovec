@@ -13,6 +13,8 @@ uint32_t nanovec_dist_hamming_scalar(const uint64_t *a, const uint64_t *b, uint3
 float nanovec_dist_l2_avx2(const float *a, const float *b, uint32_t dim);
 float nanovec_dist_dot_avx2(const float *a, const float *b, uint32_t dim);
 float nanovec_dist_cosine_avx2(const float *a, const float *b, uint32_t dim);
+
+float nanovec_dist_l2_avx512(const float *a, const float *b, uint32_t dim);
 #endif
 
 #endif /* NANOVEC_MATH_DISTANCE_H */
