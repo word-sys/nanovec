@@ -37,4 +37,37 @@ void   nanovec_slab_destroy(nanovec_slab_t *slab);
 size_t nanovec_slab_active_count(const nanovec_slab_t *slab);
 size_t nanovec_slab_capacity(const nanovec_slab_t *slab);
 
+typedef struct nanovec_arena_block nanovec_arena_block_t;
+
+typedef struct nanovec_arena {
+    nanovec_arena_block_t *head;
+    nanovec_arena_block_t *current;
+    size_t                 block_size;
+    size_t                 total_used;
+    size_t                 total_capacity;
+    size_t                 block_count;
+} nanovec_arena_t;
+
+typedef struct nanovec_arena_mark {
+    nanovec_arena_block_t *block;
+    size_t                 used;
+    size_t                 total_used;
+} nanovec_arena_mark_t;
+
+nanovec_status_t     nanovec_arena_init(nanovec_arena_t *arena, size_t initial_capacity);
+void                *nanovec_arena_alloc(nanovec_arena_t *arena, size_t size, size_t align);
+void                *nanovec_arena_calloc(
+    nanovec_arena_t *arena,
+    size_t           count,
+    size_t           elem_size,
+    size_t           align
+);
+nanovec_arena_mark_t nanovec_arena_save(const nanovec_arena_t *arena);
+void                 nanovec_arena_restore(nanovec_arena_t *arena, nanovec_arena_mark_t mark);
+void                 nanovec_arena_reset(nanovec_arena_t *arena);
+void                 nanovec_arena_trim(nanovec_arena_t *arena);
+void                 nanovec_arena_destroy(nanovec_arena_t *arena);
+size_t               nanovec_arena_used(const nanovec_arena_t *arena);
+size_t               nanovec_arena_capacity(const nanovec_arena_t *arena);
+
 #endif /* NANOVEC_CORE_ALLOC_H */

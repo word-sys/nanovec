@@ -304,3 +304,246 @@ size_t nanovec_slab_active_count(const nanovec_slab_t *slab) {
 size_t nanovec_slab_capacity(const nanovec_slab_t *slab) {
     return slab ? slab->chunk_count * slab->slots_per_chunk : 0U;
 }
+
+struct nanovec_arena_block {
+    nanovec_arena_block_t *next;
+    uint8_t               *data;
+    size_t                 capacity;
+    size_t                 used;
+};
+
+static nanovec_arena_block_t *nanovec_arena_block_new(size_t capacity, size_t align) {
+    size_t eff_align = align > NANOVEC_CACHE_LINE ? align : NANOVEC_CACHE_LINE;
+    size_t hdr_size  = nanovec_align_up(sizeof(nanovec_arena_block_t), eff_align);
+
+    if (NANOVEC_UNLIKELY(capacity > SIZE_MAX - eff_align || capacity > SIZE_MAX - hdr_size)) {
+        (void)nanovec_set_error(NANOVEC_ERR_OOM, "arena block size overflow");
+        return NULL;
+    }
+
+    size_t payload_cap = nanovec_align_up(capacity, NANOVEC_CACHE_LINE);
+    if (NANOVEC_UNLIKELY(payload_cap > SIZE_MAX - hdr_size)) {
+        (void)nanovec_set_error(NANOVEC_ERR_OOM, "arena block total size overflow");
+        return NULL;
+    }
+
+    uint8_t *raw = (uint8_t *)nanovec_aligned_alloc(eff_align, hdr_size + payload_cap);
+    if (NANOVEC_UNLIKELY(raw == NULL)) {
+        return NULL;
+    }
+
+    nanovec_arena_block_t *blk = (nanovec_arena_block_t *)raw;
+    blk->next     = NULL;
+    blk->data     = raw + hdr_size;
+    blk->capacity = payload_cap;
+    blk->used     = 0U;
+    return blk;
+}
+
+static void *nanovec_arena_block_try_alloc(
+    nanovec_arena_block_t *blk,
+    size_t                 size,
+    size_t                 align,
+    size_t                *out_consumed
+) {
+    uintptr_t cur = (uintptr_t)(blk->data + blk->used);
+    if (NANOVEC_UNLIKELY(cur > UINTPTR_MAX - (align - 1U))) {
+        return NULL;
+    }
+    uintptr_t aligned = (cur + (align - 1U)) & ~(align - 1U);
+    size_t    pad     = (size_t)(aligned - cur);
+    size_t    avail   = blk->capacity - blk->used;
+
+    if (pad > avail || size > avail - pad) {
+        return NULL;
+    }
+
+    size_t consumed = pad + size;
+    blk->used += consumed;
+    *out_consumed = consumed;
+    return (void *)aligned;
+}
+
+nanovec_status_t nanovec_arena_init(nanovec_arena_t *arena, size_t initial_capacity) {
+    if (NANOVEC_UNLIKELY(arena == NULL || initial_capacity == 0)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "arena_init requires non-null arena and initial_capacity > 0"
+        );
+    }
+
+    memset(arena, 0, sizeof(*arena));
+
+    nanovec_arena_block_t *blk = nanovec_arena_block_new(initial_capacity, NANOVEC_CACHE_LINE);
+    if (blk == NULL) {
+        return NANOVEC_ERR_OOM;
+    }
+
+    arena->head           = blk;
+    arena->current        = blk;
+    arena->block_size     = blk->capacity;
+    arena->total_used     = 0U;
+    arena->total_capacity = blk->capacity;
+    arena->block_count    = 1U;
+    return NANOVEC_SUCCESS;
+}
+
+void *nanovec_arena_alloc(nanovec_arena_t *arena, size_t size, size_t align) {
+    if (NANOVEC_UNLIKELY(arena == NULL || arena->current == NULL || size == 0)) {
+        (void)nanovec_set_error(NANOVEC_ERR_INVALID_ARG, "invalid arena_alloc arguments");
+        return NULL;
+    }
+    if (NANOVEC_UNLIKELY(align != 0 && !nanovec_is_pow2(align))) {
+        (void)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "arena align %zu must be a power of two",
+            align
+        );
+        return NULL;
+    }
+
+    size_t eff_align = align == 0 ? _Alignof(max_align_t) : align;
+    size_t consumed  = 0U;
+
+    void *ptr = nanovec_arena_block_try_alloc(arena->current, size, eff_align, &consumed);
+    if (NANOVEC_LIKELY(ptr != NULL)) {
+        arena->total_used += consumed;
+        return ptr;
+    }
+
+    nanovec_arena_block_t *blk = arena->current;
+    while (blk->next != NULL) {
+        blk = blk->next;
+        blk->used = 0U;
+        ptr = nanovec_arena_block_try_alloc(blk, size, eff_align, &consumed);
+        if (ptr != NULL) {
+            arena->current     = blk;
+            arena->total_used += consumed;
+            return ptr;
+        }
+    }
+
+    size_t next_cap = size > arena->block_size ? size : arena->block_size;
+    nanovec_arena_block_t *fresh = nanovec_arena_block_new(next_cap, eff_align);
+    if (NANOVEC_UNLIKELY(fresh == NULL)) {
+        return NULL;
+    }
+
+    blk->next              = fresh;
+    arena->current         = fresh;
+    arena->total_capacity += fresh->capacity;
+    arena->block_count++;
+
+    ptr = nanovec_arena_block_try_alloc(fresh, size, eff_align, &consumed);
+    arena->total_used += consumed;
+    return ptr;
+}
+
+void *nanovec_arena_calloc(
+    nanovec_arena_t *arena,
+    size_t           count,
+    size_t           elem_size,
+    size_t           align
+) {
+    if (NANOVEC_UNLIKELY(count == 0 || elem_size == 0)) {
+        (void)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "arena_calloc count (%zu) and elem_size (%zu) must be > 0",
+            count,
+            elem_size
+        );
+        return NULL;
+    }
+    if (NANOVEC_UNLIKELY(elem_size > SIZE_MAX / count)) {
+        (void)nanovec_set_error(NANOVEC_ERR_OOM, "arena_calloc size overflow");
+        return NULL;
+    }
+
+    size_t total = count * elem_size;
+    void *ptr = nanovec_arena_alloc(arena, total, align);
+    if (ptr != NULL) {
+        memset(ptr, 0, total);
+    }
+    return ptr;
+}
+
+nanovec_arena_mark_t nanovec_arena_save(const nanovec_arena_t *arena) {
+    nanovec_arena_mark_t mark = { NULL, 0U, 0U };
+    if (arena != NULL && arena->current != NULL) {
+        mark.block      = arena->current;
+        mark.used       = arena->current->used;
+        mark.total_used = arena->total_used;
+    }
+    return mark;
+}
+
+void nanovec_arena_restore(nanovec_arena_t *arena, nanovec_arena_mark_t mark) {
+    if (NANOVEC_UNLIKELY(arena == NULL || mark.block == NULL)) {
+        return;
+    }
+
+    mark.block->used = mark.used;
+    nanovec_arena_block_t *b = mark.block->next;
+    while (b != NULL) {
+        b->used = 0U;
+        b = b->next;
+    }
+    arena->current    = mark.block;
+    arena->total_used = mark.total_used;
+}
+
+void nanovec_arena_reset(nanovec_arena_t *arena) {
+    if (NANOVEC_UNLIKELY(arena == NULL || arena->head == NULL)) {
+        return;
+    }
+
+    nanovec_arena_block_t *b = arena->head;
+    while (b != NULL) {
+        b->used = 0U;
+        b = b->next;
+    }
+    arena->current    = arena->head;
+    arena->total_used = 0U;
+}
+
+void nanovec_arena_trim(nanovec_arena_t *arena) {
+    if (NANOVEC_UNLIKELY(arena == NULL || arena->head == NULL)) {
+        return;
+    }
+
+    nanovec_arena_block_t *b = arena->head->next;
+    while (b != NULL) {
+        nanovec_arena_block_t *next = b->next;
+        nanovec_aligned_free(b);
+        b = next;
+    }
+
+    arena->head->next     = NULL;
+    arena->head->used     = 0U;
+    arena->current        = arena->head;
+    arena->total_used     = 0U;
+    arena->total_capacity = arena->head->capacity;
+    arena->block_count    = 1U;
+}
+
+void nanovec_arena_destroy(nanovec_arena_t *arena) {
+    if (arena == NULL) {
+        return;
+    }
+
+    nanovec_arena_block_t *b = arena->head;
+    while (b != NULL) {
+        nanovec_arena_block_t *next = b->next;
+        nanovec_aligned_free(b);
+        b = next;
+    }
+    memset(arena, 0, sizeof(*arena));
+}
+
+size_t nanovec_arena_used(const nanovec_arena_t *arena) {
+    return arena ? arena->total_used : 0U;
+}
+
+size_t nanovec_arena_capacity(const nanovec_arena_t *arena) {
+    return arena ? arena->total_capacity : 0U;
+}
