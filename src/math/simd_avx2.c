@@ -44,3 +44,32 @@ float nanovec_dist_l2_avx2(const float *a, const float *b, uint32_t dim) {
     }
     return total;
 }
+
+float nanovec_dist_dot_avx2(const float *a, const float *b, uint32_t dim) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+
+    uint32_t i = 0;
+    uint32_t limit32 = dim & ~31U;
+    for (; i < limit32; i += 32U) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), acc3);
+    }
+
+    acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+
+    uint32_t limit8 = dim & ~7U;
+    for (; i < limit8; i += 8U) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+    }
+
+    float total = nanovec_hsum256_ps(acc0);
+    for (; i < dim; ++i) {
+        total += a[i] * b[i];
+    }
+    return 0.0f - total;
+}
