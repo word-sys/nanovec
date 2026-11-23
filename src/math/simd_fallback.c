@@ -1,4 +1,5 @@
 #include "math/distance.h"
+#include "core/bitops.h"
 
 #include <math.h>
 
@@ -102,4 +103,24 @@ float nanovec_dist_cosine_scalar(const float *a, const float *b, uint32_t dim) {
         sim = -1.0;
     }
     return (float)(1.0 - sim);
+}
+
+uint32_t nanovec_dist_hamming_scalar(const uint64_t *a, const uint64_t *b, uint32_t num_words) {
+    uint32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+
+    uint32_t i = 0;
+    uint32_t limit = num_words & ~3U;
+    for (; i < limit; i += 4U) {
+        c0 += nanovec_popcount64(a[i]     ^ b[i]);
+        c1 += nanovec_popcount64(a[i + 1] ^ b[i + 1]);
+        c2 += nanovec_popcount64(a[i + 2] ^ b[i + 2]);
+        c3 += nanovec_popcount64(a[i + 3] ^ b[i + 3]);
+    }
+
+    uint32_t tail = 0;
+    for (; i < num_words; ++i) {
+        tail += nanovec_popcount64(a[i] ^ b[i]);
+    }
+
+    return (c0 + c1) + (c2 + c3) + tail;
 }
