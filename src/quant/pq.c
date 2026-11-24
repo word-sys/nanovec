@@ -121,3 +121,111 @@ nanovec_status_t nanovec_pq_train(
     pq->trained = true;
     return NANOVEC_SUCCESS;
 }
+
+nanovec_status_t nanovec_pq_encode(
+    const nanovec_pq_t *pq,
+    const float        *in,
+    uint8_t            *out_code
+) {
+    if (NANOVEC_UNLIKELY(pq == NULL || !pq->trained || in == NULL || out_code == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "pq_encode requires trained pq and non-null in/out_code"
+        );
+    }
+
+    uint32_t m       = pq->m;
+    uint32_t sub_dim = pq->sub_dim;
+    uint32_t ksub    = pq->ksub;
+
+    for (uint32_t s = 0; s < m; ++s) {
+        const float *sub_vec   = in + (size_t)s * sub_dim;
+        const float *sub_cents = pq->centroids + ((size_t)s * ksub * sub_dim);
+        uint32_t best = nanovec_kmeans_assign_one(sub_vec, sub_cents, ksub, sub_dim, NULL);
+        out_code[s] = (uint8_t)best;
+    }
+    return NANOVEC_SUCCESS;
+}
+
+nanovec_status_t nanovec_pq_encode_batch(
+    const nanovec_pq_t *pq,
+    const float        *in,
+    uint8_t            *out_codes,
+    size_t              count
+) {
+    if (NANOVEC_UNLIKELY(
+            pq == NULL || !pq->trained || (count > 0 && (in == NULL || out_codes == NULL))
+        )) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "pq_encode_batch requires trained pq and valid buffers"
+        );
+    }
+
+    uint32_t dim     = pq->dim;
+    uint32_t m       = pq->m;
+    uint32_t sub_dim = pq->sub_dim;
+    uint32_t ksub    = pq->ksub;
+
+    /* Subspace-major loop keeps each 256-centroid codebook resident in L1 cache. */
+    for (uint32_t s = 0; s < m; ++s) {
+        const float *sub_cents = pq->centroids + ((size_t)s * ksub * sub_dim);
+        size_t col_off = (size_t)s * sub_dim;
+        for (size_t i = 0; i < count; ++i) {
+            const float *sub_vec = in + i * dim + col_off;
+            uint32_t best = nanovec_kmeans_assign_one(sub_vec, sub_cents, ksub, sub_dim, NULL);
+            out_codes[i * m + s] = (uint8_t)best;
+        }
+    }
+    return NANOVEC_SUCCESS;
+}
+
+nanovec_status_t nanovec_pq_decode(
+    const nanovec_pq_t *pq,
+    const uint8_t      *in_code,
+    float              *out_vec
+) {
+    if (NANOVEC_UNLIKELY(pq == NULL || !pq->trained || in_code == NULL || out_vec == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "pq_decode requires trained pq and non-null in_code/out_vec"
+        );
+    }
+
+    uint32_t m       = pq->m;
+    uint32_t sub_dim = pq->sub_dim;
+    size_t   sub_bytes = (size_t)sub_dim * sizeof(float);
+
+    for (uint32_t s = 0; s < m; ++s) {
+        const float *c = nanovec_pq_centroid(pq, s, in_code[s]);
+        memcpy(out_vec + (size_t)s * sub_dim, c, sub_bytes);
+    }
+    return NANOVEC_SUCCESS;
+}
+
+nanovec_status_t nanovec_pq_decode_batch(
+    const nanovec_pq_t *pq,
+    const uint8_t      *in_codes,
+    float              *out_vecs,
+    size_t              count
+) {
+    if (NANOVEC_UNLIKELY(
+            pq == NULL || !pq->trained || (count > 0 && (in_codes == NULL || out_vecs == NULL))
+        )) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "pq_decode_batch requires trained pq and valid buffers"
+        );
+    }
+
+    uint32_t dim = pq->dim;
+    uint32_t m   = pq->m;
+
+    for (size_t i = 0; i < count; ++i) {
+        nanovec_status_t st = nanovec_pq_decode(pq, in_codes + i * m, out_vecs + i * dim);
+        if (NANOVEC_UNLIKELY(st != NANOVEC_SUCCESS)) {
+            return st;
+        }
+    }
+    return NANOVEC_SUCCESS;
+}
