@@ -25,4 +25,21 @@ float nanovec_dist_dot_neon(const float *a, const float *b, uint32_t dim);
 float nanovec_dist_cosine_neon(const float *a, const float *b, uint32_t dim);
 #endif
 
+typedef float    (*nanovec_dist_f32_fn_t)(const float *a, const float *b, uint32_t dim);
+typedef uint32_t (*nanovec_dist_hamming_fn_t)(const uint64_t *a, const uint64_t *b, uint32_t num_words);
+
+extern nanovec_dist_f32_fn_t     nanovec_dist_l2_fn;
+extern nanovec_dist_f32_fn_t     nanovec_dist_dot_fn;
+extern nanovec_dist_f32_fn_t     nanovec_dist_cosine_fn;
+extern nanovec_dist_hamming_fn_t nanovec_dist_hamming_fn;
+
+void                  nanovec_math_init(void);
+nanovec_dist_f32_fn_t nanovec_get_dist_f32_fn(nanovec_metric_t metric);
+float                 nanovec_compute_distance(
+    nanovec_metric_t metric,
+    const void      *a,
+    const void      *b,
+    uint32_t         dim
+);
+
 #endif /* NANOVEC_MATH_DISTANCE_H */
