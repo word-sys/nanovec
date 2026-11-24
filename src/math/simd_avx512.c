@@ -1,4 +1,5 @@
 #include "math/distance.h"
+#include "math/prefetch.h"
 
 #include <immintrin.h>
 #include <math.h>
@@ -12,6 +13,10 @@ float nanovec_dist_l2_avx512(const float *a, const float *b, uint32_t dim) {
     uint32_t i = 0;
     uint32_t limit64 = dim & ~63U;
     for (; i < limit64; i += 64U) {
+        if (i + 128U < dim) {
+            nanovec_prefetch_l1(a + i + 128U);
+            nanovec_prefetch_l1(b + i + 128U);
+        }
         __m512 d0 = _mm512_sub_ps(_mm512_loadu_ps(a + i),      _mm512_loadu_ps(b + i));
         __m512 d1 = _mm512_sub_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16));
         __m512 d2 = _mm512_sub_ps(_mm512_loadu_ps(a + i + 32), _mm512_loadu_ps(b + i + 32));
@@ -47,6 +52,10 @@ float nanovec_dist_dot_avx512(const float *a, const float *b, uint32_t dim) {
     uint32_t i = 0;
     uint32_t limit64 = dim & ~63U;
     for (; i < limit64; i += 64U) {
+        if (i + 128U < dim) {
+            nanovec_prefetch_l1(a + i + 128U);
+            nanovec_prefetch_l1(b + i + 128U);
+        }
         acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i),      _mm512_loadu_ps(b + i),      acc0);
         acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16), acc1);
         acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 32), _mm512_loadu_ps(b + i + 32), acc2);
@@ -78,6 +87,10 @@ float nanovec_dist_cosine_avx512(const float *a, const float *b, uint32_t dim) {
     uint32_t i = 0;
     uint32_t limit64 = dim & ~63U;
     for (; i < limit64; i += 64U) {
+        if (i + 128U < dim) {
+            nanovec_prefetch_l1(a + i + 128U);
+            nanovec_prefetch_l1(b + i + 128U);
+        }
         __m512 va0 = _mm512_loadu_ps(a + i);
         __m512 vb0 = _mm512_loadu_ps(b + i);
         dot0 = _mm512_fmadd_ps(va0, vb0, dot0);

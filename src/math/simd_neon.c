@@ -1,4 +1,5 @@
 #include "math/distance.h"
+#include "math/prefetch.h"
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 
@@ -31,6 +32,10 @@ float nanovec_dist_l2_neon(const float *a, const float *b, uint32_t dim) {
     uint32_t i = 0;
     uint32_t limit16 = dim & ~15U;
     for (; i < limit16; i += 16U) {
+        if (i + 32U < dim) {
+            nanovec_prefetch_l1(a + i + 32U);
+            nanovec_prefetch_l1(b + i + 32U);
+        }
         float32x4_t d0 = vsubq_f32(vld1q_f32(a + i),      vld1q_f32(b + i));
         float32x4_t d1 = vsubq_f32(vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
         float32x4_t d2 = vsubq_f32(vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
@@ -66,6 +71,10 @@ float nanovec_dist_dot_neon(const float *a, const float *b, uint32_t dim) {
     uint32_t i = 0;
     uint32_t limit16 = dim & ~15U;
     for (; i < limit16; i += 16U) {
+        if (i + 32U < dim) {
+            nanovec_prefetch_l1(a + i + 32U);
+            nanovec_prefetch_l1(b + i + 32U);
+        }
         acc0 = NANOVEC_VFMAQ_F32(acc0, vld1q_f32(a + i),      vld1q_f32(b + i));
         acc1 = NANOVEC_VFMAQ_F32(acc1, vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
         acc2 = NANOVEC_VFMAQ_F32(acc2, vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
@@ -97,6 +106,10 @@ float nanovec_dist_cosine_neon(const float *a, const float *b, uint32_t dim) {
     uint32_t i = 0;
     uint32_t limit16 = dim & ~15U;
     for (; i < limit16; i += 16U) {
+        if (i + 32U < dim) {
+            nanovec_prefetch_l1(a + i + 32U);
+            nanovec_prefetch_l1(b + i + 32U);
+        }
         float32x4_t va0 = vld1q_f32(a + i);
         float32x4_t vb0 = vld1q_f32(b + i);
         dot0 = NANOVEC_VFMAQ_F32(dot0, va0, vb0);

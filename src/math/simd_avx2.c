@@ -1,4 +1,5 @@
 #include "math/distance.h"
+#include "math/prefetch.h"
 
 #include <immintrin.h>
 #include <math.h>
@@ -20,6 +21,10 @@ float nanovec_dist_l2_avx2(const float *a, const float *b, uint32_t dim) {
     uint32_t i = 0;
     uint32_t limit32 = dim & ~31U;
     for (; i < limit32; i += 32U) {
+        if (i + 64U < dim) {
+            nanovec_prefetch_l1(a + i + 64U);
+            nanovec_prefetch_l1(b + i + 64U);
+        }
         __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i));
         __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8));
         __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16));
@@ -55,6 +60,10 @@ float nanovec_dist_dot_avx2(const float *a, const float *b, uint32_t dim) {
     uint32_t i = 0;
     uint32_t limit32 = dim & ~31U;
     for (; i < limit32; i += 32U) {
+        if (i + 64U < dim) {
+            nanovec_prefetch_l1(a + i + 64U);
+            nanovec_prefetch_l1(b + i + 64U);
+        }
         acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      acc0);
         acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  acc1);
         acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), acc2);
@@ -86,6 +95,10 @@ float nanovec_dist_cosine_avx2(const float *a, const float *b, uint32_t dim) {
     uint32_t i = 0;
     uint32_t limit32 = dim & ~31U;
     for (; i < limit32; i += 32U) {
+        if (i + 64U < dim) {
+            nanovec_prefetch_l1(a + i + 64U);
+            nanovec_prefetch_l1(b + i + 64U);
+        }
         __m256 va0 = _mm256_loadu_ps(a + i);
         __m256 vb0 = _mm256_loadu_ps(b + i);
         dot0 = _mm256_fmadd_ps(va0, vb0, dot0);
