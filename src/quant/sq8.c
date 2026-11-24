@@ -181,3 +181,52 @@ nanovec_status_t nanovec_sq8_encode_batch(
     }
     return NANOVEC_SUCCESS;
 }
+
+nanovec_status_t nanovec_sq8_decode(
+    const nanovec_sq8_t *sq,
+    const uint8_t       *in,
+    float               *out
+) {
+    if (NANOVEC_UNLIKELY(sq == NULL || !sq->trained || in == NULL || out == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "sq8_decode requires trained sq and non-null in/out buffers"
+        );
+    }
+
+    const float *min_v = sq->min_val;
+    const float *sc    = sq->scale;
+    uint32_t dim = sq->dim;
+
+    for (uint32_t d = 0; d < dim; ++d) {
+        out[d] = min_v[d] + (float)in[d] * sc[d];
+    }
+    return NANOVEC_SUCCESS;
+}
+
+nanovec_status_t nanovec_sq8_decode_batch(
+    const nanovec_sq8_t *sq,
+    const uint8_t       *in,
+    float               *out,
+    size_t               count
+) {
+    if (NANOVEC_UNLIKELY(sq == NULL || !sq->trained || (count > 0 && (in == NULL || out == NULL)))) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "sq8_decode_batch requires trained sq and valid buffers"
+        );
+    }
+
+    const float *min_v = sq->min_val;
+    const float *sc    = sq->scale;
+    uint32_t dim = sq->dim;
+
+    for (size_t i = 0; i < count; ++i) {
+        const uint8_t *src = in + i * dim;
+        float         *dst = out + i * dim;
+        for (uint32_t d = 0; d < dim; ++d) {
+            dst[d] = min_v[d] + (float)src[d] * sc[d];
+        }
+    }
+    return NANOVEC_SUCCESS;
+}

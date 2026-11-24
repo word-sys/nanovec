@@ -35,4 +35,17 @@ nanovec_status_t nanovec_sq8_encode_batch(
     size_t               count
 );
 
+nanovec_status_t nanovec_sq8_decode(
+    const nanovec_sq8_t *sq,
+    const uint8_t       *in,
+    float               *out
+);
+
+nanovec_status_t nanovec_sq8_decode_batch(
+    const nanovec_sq8_t *sq,
+    const uint8_t       *in,
+    float               *out,
+    size_t               count
+);
+
 #endif /* NANOVEC_QUANT_SQ8_H */
