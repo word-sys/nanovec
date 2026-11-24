@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Barın Güzeldemirci
+
 ifeq ($(origin CC),default)
     CC := gcc
 endif

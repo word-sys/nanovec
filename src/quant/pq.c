@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright (c) 2026 Barın Güzeldemirci */
+
 #include "quant/pq.h"
 #include "core/alloc.h"
 #include "core/error.h"

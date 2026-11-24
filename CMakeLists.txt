@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Barın Güzeldemirci
+
 cmake_minimum_required(VERSION 3.16)
 
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/nanovec_version.h" _nanovec_ver_h)
