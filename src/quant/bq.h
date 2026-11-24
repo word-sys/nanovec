@@ -22,4 +22,7 @@ nanovec_status_t nanovec_bq_encode_batch(
 );
 nanovec_status_t nanovec_bq_decode(const uint64_t *in, uint32_t dim, float *out);
 
+uint32_t nanovec_bq_distance_scalar(const uint64_t *a, const uint64_t *b, uint32_t num_words);
+uint32_t nanovec_bq_distance(const uint64_t *a, const uint64_t *b, uint32_t num_words);
+
 #endif /* NANOVEC_QUANT_BQ_H */
