@@ -262,6 +262,98 @@ int main(void) {
     CHECK(sq8_pd_mse < pq_mse && pq_mse < bq_mse);
     CHECK(sq8_pd_cos < pq_cos && pq_cos < bq_cos);
 
+    /* 4. Two-Stage Filtering Pipeline (Coarse BQ/PQ + Fine FP32 Re-ranking) */
+    {
+        const uint32_t TOP_K = 10U;
+        uint64_t *vids = (uint64_t *)nanovec_aligned_alloc(64, (size_t)TEST_N * sizeof(uint64_t));
+        uint64_t *bcodes = (uint64_t *)nanovec_aligned_alloc(
+            64, (size_t)TEST_N * nanovec_bq_num_words(TEST_DIM) * sizeof(uint64_t)
+        );
+        uint8_t *pcodes = (uint8_t *)nanovec_aligned_alloc(64, (size_t)TEST_N * TEST_PQ_M);
+        CHECK(vids && bcodes && pcodes);
+
+        for (size_t i = 0; i < TEST_N; ++i) {
+            vids[i] = 10000ULL + (uint64_t)i * 7ULL;
+        }
+        CHECK(nanovec_bq_encode_batch(vecs, TEST_DIM, TEST_N, bcodes) == NANOVEC_SUCCESS);
+
+        nanovec_pq_t pq;
+        CHECK(nanovec_pq_init(&pq, TEST_DIM, TEST_PQ_M) == NANOVEC_SUCCESS);
+        CHECK(nanovec_pq_train(&pq, vecs, TEST_N, 8, 34ULL) == NANOVEC_SUCCESS);
+        CHECK(nanovec_pq_encode_batch(&pq, vecs, pcodes, TEST_N) == NANOVEC_SUCCESS);
+
+        /* Ground-truth exact top-K via full FP32 scan */
+        nanovec_result_t gt[10];
+        for (uint32_t i = 0; i < TOP_K; ++i) {
+            gt[i].id = UINT64_MAX;
+            gt[i].distance = 1e30f;
+            gt[i]._pad = 0U;
+        }
+        for (size_t i = 0; i < TEST_N; ++i) {
+            float d = nanovec_dist_l2_fn(query, vecs + i * TEST_DIM, TEST_DIM);
+            if (d < gt[TOP_K - 1U].distance) {
+                uint32_t pos = TOP_K - 1U;
+                while (pos > 0U && d < gt[pos - 1U].distance) {
+                    gt[pos] = gt[pos - 1U];
+                    --pos;
+                }
+                gt[pos].id = vids[i];
+                gt[pos].distance = d;
+            }
+        }
+
+        nanovec_result_t bq_res[10], pq_res[10];
+        size_t bq_cnt = 0, pq_cnt = 0;
+        CHECK(nanovec_rerank_bq(
+            query, TEST_DIM, bcodes, vecs, vids, TEST_N,
+            NANOVEC_METRIC_L2, TOP_K, 10U, NULL, NULL, bq_res, &bq_cnt
+        ) == NANOVEC_SUCCESS);
+        CHECK(nanovec_rerank_pq(
+            &pq, query, pcodes, vecs, vids, TEST_N,
+            NANOVEC_METRIC_L2, TOP_K, 10U, NULL, NULL, pq_res, &pq_cnt
+        ) == NANOVEC_SUCCESS);
+        CHECK(bq_cnt == TOP_K && pq_cnt == TOP_K);
+
+        /* Results sorted ascending and exact FP32 distances */
+        for (uint32_t i = 1; i < TOP_K; ++i) {
+            CHECK(bq_res[i].distance >= bq_res[i - 1U].distance);
+            CHECK(pq_res[i].distance >= pq_res[i - 1U].distance);
+        }
+
+        uint32_t bq_hits = 0, pq_hits = 0;
+        for (uint32_t i = 0; i < TOP_K; ++i) {
+            for (uint32_t j = 0; j < TOP_K; ++j) {
+                if (bq_res[i].id == gt[j].id) bq_hits++;
+                if (pq_res[i].id == gt[j].id) pq_hits++;
+            }
+        }
+        CHECK(bq_hits >= 8U);
+        CHECK(pq_hits >= 9U);
+        CHECK(pq_res[0].id == gt[0].id);
+
+        (void)printf(
+            "  [Two-Stage  ] Recall@10 (10x rerank): BQ+FP32=%.0f%% | PQ+FP32=%.0f%%\n",
+            100.0 * (double)bq_hits / (double)TOP_K,
+            100.0 * (double)pq_hits / (double)TOP_K
+        );
+
+        /* Edge cases: empty dataset, top_k=0, unsupported metric */
+        size_t zcnt = 99;
+        CHECK(nanovec_rerank_bq(
+            query, TEST_DIM, bcodes, vecs, NULL, 0,
+            NANOVEC_METRIC_L2, TOP_K, 10U, NULL, NULL, bq_res, &zcnt
+        ) == NANOVEC_SUCCESS && zcnt == 0U);
+        CHECK(nanovec_rerank_pq(
+            &pq, query, pcodes, vecs, NULL, TEST_N,
+            NANOVEC_METRIC_HAMMING, TOP_K, 10U, NULL, NULL, pq_res, &zcnt
+        ) == NANOVEC_ERR_UNSUPPORTED);
+
+        nanovec_pq_destroy(&pq);
+        nanovec_aligned_free(vids);
+        nanovec_aligned_free(bcodes);
+        nanovec_aligned_free(pcodes);
+    }
+
     nanovec_aligned_free(vecs);
     nanovec_aligned_free(recon);
     nanovec_aligned_free(query);

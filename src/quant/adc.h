@@ -54,4 +54,42 @@ void  nanovec_adc_distance_batch(
     float                     *out_dists
 );
 
+typedef const float *(*nanovec_vec_fetch_fn_t)(
+    uint32_t slot,
+    void    *user_ctx,
+    float   *scratch_buf
+);
+
+nanovec_status_t nanovec_rerank_bq(
+    const float            *query,
+    uint32_t                dim,
+    const uint64_t         *bq_codes,
+    const float            *fp32_vectors,
+    const uint64_t         *vids,
+    size_t                  count,
+    nanovec_metric_t        metric,
+    uint32_t                top_k,
+    uint32_t                rerank_factor,
+    nanovec_vec_fetch_fn_t  fetch_fn,
+    void                   *fetch_ctx,
+    nanovec_result_t       *out_results,
+    size_t                 *out_count
+);
+
+nanovec_status_t nanovec_rerank_pq(
+    const nanovec_pq_t     *pq,
+    const float            *query,
+    const uint8_t          *pq_codes,
+    const float            *fp32_vectors,
+    const uint64_t         *vids,
+    size_t                  count,
+    nanovec_metric_t        metric,
+    uint32_t                top_k,
+    uint32_t                rerank_factor,
+    nanovec_vec_fetch_fn_t  fetch_fn,
+    void                   *fetch_ctx,
+    nanovec_result_t       *out_results,
+    size_t                 *out_count
+);
+
 #endif /* NANOVEC_QUANT_ADC_H */

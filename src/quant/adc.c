@@ -6,6 +6,7 @@
 #include "core/error.h"
 #include "math/distance.h"
 #include "math/prefetch.h"
+#include "quant/bq.h"
 
 #include <math.h>
 #include <string.h>
@@ -304,4 +305,312 @@ void nanovec_adc_distance_batch(
 #endif
         out_dists[i] = nanovec_adc_distance_scalar(tbl, pq_codes + i * stride);
     }
+}
+
+#define NANOVEC_RERANK_DEFAULT_FACTOR 10U
+
+typedef struct nanovec_cand {
+    float    dist;
+    uint32_t slot;
+} nanovec_cand_t;
+
+static inline bool nanovec_cand_worse(nanovec_cand_t a, nanovec_cand_t b) {
+    return a.dist > b.dist || (a.dist == b.dist && a.slot > b.slot);
+}
+
+static void nanovec_maxheap_sift_down(nanovec_cand_t *h, uint32_t n, uint32_t idx) {
+    for (;;) {
+        uint32_t left  = (idx << 1) + 1U;
+        uint32_t right = left + 1U;
+        uint32_t worst = idx;
+
+        if (left < n && nanovec_cand_worse(h[left], h[worst])) {
+            worst = left;
+        }
+        if (right < n && nanovec_cand_worse(h[right], h[worst])) {
+            worst = right;
+        }
+        if (worst == idx) {
+            break;
+        }
+        nanovec_cand_t tmp = h[idx];
+        h[idx]   = h[worst];
+        h[worst] = tmp;
+        idx = worst;
+    }
+}
+
+static void nanovec_maxheap_push(
+    nanovec_cand_t *h,
+    uint32_t       *size,
+    uint32_t        cap,
+    float           dist,
+    uint32_t        slot
+) {
+    nanovec_cand_t item = { dist, slot };
+    if (*size < cap) {
+        uint32_t idx = (*size)++;
+        h[idx] = item;
+        while (idx > 0U) {
+            uint32_t parent = (idx - 1U) >> 1;
+            if (!nanovec_cand_worse(h[idx], h[parent])) {
+                break;
+            }
+            nanovec_cand_t tmp = h[parent];
+            h[parent] = h[idx];
+            h[idx]    = tmp;
+            idx = parent;
+        }
+    } else if (nanovec_cand_worse(h[0], item)) {
+        h[0] = item;
+        nanovec_maxheap_sift_down(h, cap, 0U);
+    }
+}
+
+static void nanovec_maxheap_sort_asc(nanovec_cand_t *h, uint32_t n) {
+    for (uint32_t end = n; end > 1U; --end) {
+        nanovec_cand_t tmp = h[0];
+        h[0]       = h[end - 1U];
+        h[end - 1U] = tmp;
+        nanovec_maxheap_sift_down(h, end - 1U, 0U);
+    }
+}
+
+static uint32_t nanovec_resolve_coarse_n(size_t count, uint32_t top_k, uint32_t rerank_factor) {
+    uint32_t factor = rerank_factor > 0U ? rerank_factor : NANOVEC_RERANK_DEFAULT_FACTOR;
+    if (top_k >= count) {
+        return (uint32_t)count;
+    }
+    if ((size_t)top_k > count / (size_t)factor) {
+        return (uint32_t)count;
+    }
+    uint32_t n = top_k * factor;
+    return n < top_k ? top_k : n;
+}
+
+static nanovec_status_t nanovec_rerank_fine_pass(
+    const float            *query,
+    uint32_t                dim,
+    const nanovec_cand_t   *coarse,
+    uint32_t                coarse_n,
+    const float            *fp32_vectors,
+    const uint64_t         *vids,
+    nanovec_dist_f32_fn_t   dist_fn,
+    uint32_t                k,
+    nanovec_vec_fetch_fn_t  fetch_fn,
+    void                   *fetch_ctx,
+    nanovec_result_t       *out_results,
+    size_t                 *out_count
+) {
+    nanovec_cand_t *fine = (nanovec_cand_t *)nanovec_aligned_alloc(
+        NANOVEC_CACHE_LINE,
+        (size_t)k * sizeof(nanovec_cand_t)
+    );
+    if (NANOVEC_UNLIKELY(fine == NULL)) {
+        return NANOVEC_ERR_OOM;
+    }
+
+    float *scratch = NULL;
+    if (fp32_vectors == NULL) {
+        scratch = (float *)nanovec_aligned_alloc(NANOVEC_CACHE_LINE, (size_t)dim * sizeof(float));
+        if (NANOVEC_UNLIKELY(scratch == NULL)) {
+            nanovec_aligned_free(fine);
+            return NANOVEC_ERR_OOM;
+        }
+    }
+
+    uint32_t fine_size = 0U;
+    for (uint32_t i = 0; i < coarse_n; ++i) {
+        uint32_t slot = coarse[i].slot;
+        const float *vec = NULL;
+        if (fp32_vectors != NULL) {
+            if (i + 1U < coarse_n) {
+                nanovec_prefetch_l1(fp32_vectors + (size_t)coarse[i + 1U].slot * dim);
+            }
+            vec = fp32_vectors + (size_t)slot * dim;
+        } else {
+            vec = fetch_fn(slot, fetch_ctx, scratch);
+            if (NANOVEC_UNLIKELY(vec == NULL)) {
+                continue;
+            }
+        }
+        float exact_d = dist_fn(query, vec, dim);
+        nanovec_maxheap_push(fine, &fine_size, k, exact_d, slot);
+    }
+
+    nanovec_maxheap_sort_asc(fine, fine_size);
+    for (uint32_t i = 0; i < fine_size; ++i) {
+        out_results[i].id       = vids != NULL ? vids[fine[i].slot] : (uint64_t)fine[i].slot;
+        out_results[i].distance = fine[i].dist;
+        out_results[i]._pad     = 0U;
+    }
+    *out_count = fine_size;
+
+    nanovec_aligned_free(scratch);
+    nanovec_aligned_free(fine);
+    return NANOVEC_SUCCESS;
+}
+
+nanovec_status_t nanovec_rerank_bq(
+    const float            *query,
+    uint32_t                dim,
+    const uint64_t         *bq_codes,
+    const float            *fp32_vectors,
+    const uint64_t         *vids,
+    size_t                  count,
+    nanovec_metric_t        metric,
+    uint32_t                top_k,
+    uint32_t                rerank_factor,
+    nanovec_vec_fetch_fn_t  fetch_fn,
+    void                   *fetch_ctx,
+    nanovec_result_t       *out_results,
+    size_t                 *out_count
+) {
+    if (NANOVEC_UNLIKELY(out_count == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(NANOVEC_ERR_INVALID_ARG, "out_count is null");
+    }
+    *out_count = 0U;
+
+    if (count == 0U || top_k == 0U) {
+        return NANOVEC_SUCCESS;
+    }
+    if (NANOVEC_UNLIKELY(
+            query == NULL || dim == 0U || bq_codes == NULL || out_results == NULL ||
+            (fp32_vectors == NULL && fetch_fn == NULL)
+        )) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "rerank_bq requires valid query, dim, bq_codes, out_results, and vector source"
+        );
+    }
+
+    nanovec_dist_f32_fn_t dist_fn = nanovec_get_dist_f32_fn(metric);
+    if (NANOVEC_UNLIKELY(dist_fn == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_UNSUPPORTED,
+            "rerank_bq requires an FP32 metric (L2, COSINE, or DOT)"
+        );
+    }
+
+    uint32_t k        = (uint32_t)(top_k < count ? top_k : count);
+    uint32_t coarse_n = nanovec_resolve_coarse_n(count, k, rerank_factor);
+    uint32_t words    = nanovec_bq_num_words(dim);
+
+    uint64_t *q_bq = (uint64_t *)nanovec_aligned_alloc(
+        NANOVEC_CACHE_LINE,
+        (size_t)words * sizeof(uint64_t)
+    );
+    nanovec_cand_t *coarse = (nanovec_cand_t *)nanovec_aligned_alloc(
+        NANOVEC_CACHE_LINE,
+        (size_t)coarse_n * sizeof(nanovec_cand_t)
+    );
+    if (NANOVEC_UNLIKELY(!q_bq || !coarse)) {
+        nanovec_aligned_free(q_bq);
+        nanovec_aligned_free(coarse);
+        return NANOVEC_ERR_OOM;
+    }
+
+    nanovec_status_t st = nanovec_bq_encode(query, dim, q_bq);
+    if (NANOVEC_UNLIKELY(st != NANOVEC_SUCCESS)) {
+        nanovec_aligned_free(q_bq);
+        nanovec_aligned_free(coarse);
+        return st;
+    }
+
+    uint32_t coarse_size = 0U;
+    for (size_t i = 0; i < count; ++i) {
+        if (i + 2U < count) {
+            nanovec_prefetch_l1(bq_codes + (i + 2U) * words);
+        }
+        uint32_t h = nanovec_bq_distance(q_bq, bq_codes + i * words, words);
+        nanovec_maxheap_push(coarse, &coarse_size, coarse_n, (float)h, (uint32_t)i);
+    }
+
+    nanovec_aligned_free(q_bq);
+
+    st = nanovec_rerank_fine_pass(
+        query, dim, coarse, coarse_size, fp32_vectors, vids,
+        dist_fn, k, fetch_fn, fetch_ctx, out_results, out_count
+    );
+    nanovec_aligned_free(coarse);
+    return st;
+}
+
+nanovec_status_t nanovec_rerank_pq(
+    const nanovec_pq_t     *pq,
+    const float            *query,
+    const uint8_t          *pq_codes,
+    const float            *fp32_vectors,
+    const uint64_t         *vids,
+    size_t                  count,
+    nanovec_metric_t        metric,
+    uint32_t                top_k,
+    uint32_t                rerank_factor,
+    nanovec_vec_fetch_fn_t  fetch_fn,
+    void                   *fetch_ctx,
+    nanovec_result_t       *out_results,
+    size_t                 *out_count
+) {
+    if (NANOVEC_UNLIKELY(out_count == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(NANOVEC_ERR_INVALID_ARG, "out_count is null");
+    }
+    *out_count = 0U;
+
+    if (count == 0U || top_k == 0U) {
+        return NANOVEC_SUCCESS;
+    }
+    if (NANOVEC_UNLIKELY(
+            pq == NULL || !pq->trained || query == NULL || pq_codes == NULL ||
+            out_results == NULL || (fp32_vectors == NULL && fetch_fn == NULL)
+        )) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "rerank_pq requires trained pq, query, pq_codes, out_results, and vector source"
+        );
+    }
+
+    nanovec_dist_f32_fn_t dist_fn = nanovec_get_dist_f32_fn(metric);
+    if (NANOVEC_UNLIKELY(dist_fn == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_UNSUPPORTED,
+            "rerank_pq requires an FP32 metric (L2, COSINE, or DOT)"
+        );
+    }
+
+    nanovec_adc_table_t tbl;
+    nanovec_status_t st = nanovec_adc_build(pq, query, metric, &tbl);
+    if (NANOVEC_UNLIKELY(st != NANOVEC_SUCCESS)) {
+        return st;
+    }
+
+    uint32_t k        = (uint32_t)(top_k < count ? top_k : count);
+    uint32_t coarse_n = nanovec_resolve_coarse_n(count, k, rerank_factor);
+    size_t   m        = pq->m;
+
+    nanovec_cand_t *coarse = (nanovec_cand_t *)nanovec_aligned_alloc(
+        NANOVEC_CACHE_LINE,
+        (size_t)coarse_n * sizeof(nanovec_cand_t)
+    );
+    if (NANOVEC_UNLIKELY(coarse == NULL)) {
+        nanovec_adc_table_destroy(&tbl);
+        return NANOVEC_ERR_OOM;
+    }
+
+    uint32_t coarse_size = 0U;
+    for (size_t i = 0; i < count; ++i) {
+        if (i + 2U < count) {
+            nanovec_prefetch_l1(pq_codes + (i + 2U) * m);
+        }
+        float d = nanovec_adc_distance(&tbl, pq_codes + i * m);
+        nanovec_maxheap_push(coarse, &coarse_size, coarse_n, d, (uint32_t)i);
+    }
+
+    nanovec_adc_table_destroy(&tbl);
+
+    st = nanovec_rerank_fine_pass(
+        query, pq->dim, coarse, coarse_size, fp32_vectors, vids,
+        dist_fn, k, fetch_fn, fetch_ctx, out_results, out_count
+    );
+    nanovec_aligned_free(coarse);
+    return st;
 }
