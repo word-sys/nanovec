@@ -45,4 +45,13 @@ nanovec_status_t nanovec_adc_build(
     nanovec_adc_table_t *out_tbl
 );
 
+float nanovec_adc_distance_scalar(const nanovec_adc_table_t *tbl, const uint8_t *pq_code);
+float nanovec_adc_distance(const nanovec_adc_table_t *tbl, const uint8_t *pq_code);
+void  nanovec_adc_distance_batch(
+    const nanovec_adc_table_t *tbl,
+    const uint8_t             *pq_codes,
+    size_t                     count,
+    float                     *out_dists
+);
+
 #endif /* NANOVEC_QUANT_ADC_H */
