@@ -354,6 +354,105 @@ int main(void) {
         nanovec_aligned_free(pcodes);
     }
 
+    /* 5. Codebook & SQ8 Persistence / Zero-Copy Overlay / Corruption Guards */
+    {
+        /* SQ8 round-trip (per_dim + odd dim 385 for 64-byte padding verification) */
+        nanovec_sq8_t sq_src, sq_dst;
+        CHECK(nanovec_sq8_init(&sq_src, TEST_DIM, true) == NANOVEC_SUCCESS);
+        size_t sq_sz = nanovec_sq8_serialized_size(TEST_DIM);
+        CHECK((sq_sz % 64U) == 0U);
+        CHECK((nanovec_sq8_serialized_size(385) % 64U) == 0U);
+
+        uint8_t *sq_buf = (uint8_t *)nanovec_aligned_alloc(64, sq_sz);
+        CHECK(sq_buf != NULL);
+        CHECK(nanovec_sq8_serialize(&sq_src, sq_buf, sq_sz, NULL) == NANOVEC_ERR_INVALID_ARG);
+        CHECK(nanovec_sq8_train(&sq_src, vecs, TEST_N) == NANOVEC_SUCCESS);
+        CHECK(nanovec_sq8_serialize(&sq_src, sq_buf, sq_sz - 1U, NULL) == NANOVEC_ERR_INVALID_ARG);
+
+        size_t written = 0;
+        CHECK(nanovec_sq8_serialize(&sq_src, sq_buf, sq_sz, &written) == NANOVEC_SUCCESS);
+        CHECK(written == sq_sz);
+        CHECK(nanovec_sq8_deserialize(sq_buf, sq_sz, &sq_dst) == NANOVEC_SUCCESS);
+        CHECK(sq_dst.trained && sq_dst.per_dim == sq_src.per_dim && sq_dst.dim == sq_src.dim);
+        CHECK(memcmp(sq_dst.min_val, sq_src.min_val, TEST_DIM * sizeof(float)) == 0);
+        CHECK(memcmp(sq_dst.max_val, sq_src.max_val, TEST_DIM * sizeof(float)) == 0);
+
+        uint8_t c1[TEST_DIM], c2[TEST_DIM];
+        CHECK(nanovec_sq8_encode(&sq_src, query, c1) == NANOVEC_SUCCESS);
+        CHECK(nanovec_sq8_encode(&sq_dst, query, c2) == NANOVEC_SUCCESS);
+        CHECK(memcmp(c1, c2, TEST_DIM) == 0);
+
+        /* SQ8 corruption checks */
+        CHECK(nanovec_sq8_deserialize(sq_buf, 32, &sq_dst) == NANOVEC_ERR_CORRUPT);
+        sq_buf[0] = 'X';
+        CHECK(nanovec_sq8_deserialize(sq_buf, sq_sz, &sq_dst) == NANOVEC_ERR_CORRUPT);
+        sq_buf[0] = 'N';
+        nanovec_write_le16(sq_buf + 4, 99);
+        CHECK(nanovec_sq8_deserialize(sq_buf, sq_sz, &sq_dst) == NANOVEC_ERR_VERSION);
+        nanovec_write_le16(sq_buf + 4, 1);
+        /* Corrupt min > max */
+        nanovec_write_f32_le(sq_buf + 64, 100.0f);
+        nanovec_sq8_t sq_bad;
+        CHECK(nanovec_sq8_deserialize(sq_buf, sq_sz, &sq_bad) == NANOVEC_ERR_CORRUPT);
+
+        nanovec_sq8_destroy(&sq_src);
+        nanovec_sq8_destroy(&sq_dst);
+        nanovec_aligned_free(sq_buf);
+
+        /* PQ round-trip + zero-copy mmap overlay + corruption checks */
+        nanovec_pq_t pq_src, pq_dst, pq_mmap;
+        CHECK(nanovec_pq_init(&pq_src, TEST_DIM, TEST_PQ_M) == NANOVEC_SUCCESS);
+        size_t pq_sz = nanovec_pq_serialized_size(TEST_DIM);
+        CHECK((pq_sz % 64U) == 0U);
+
+        uint8_t *pq_buf = (uint8_t *)nanovec_aligned_alloc(64, pq_sz);
+        CHECK(pq_buf != NULL);
+        CHECK(nanovec_pq_serialize(&pq_src, pq_buf, pq_sz, NULL) == NANOVEC_ERR_INVALID_ARG);
+        CHECK(nanovec_pq_train(&pq_src, vecs, TEST_N, 6, 35ULL) == NANOVEC_SUCCESS);
+        CHECK(nanovec_pq_serialize(&pq_src, pq_buf, pq_sz - 1U, NULL) == NANOVEC_ERR_INVALID_ARG);
+
+        written = 0;
+        CHECK(nanovec_pq_serialize(&pq_src, pq_buf, pq_sz, &written) == NANOVEC_SUCCESS);
+        CHECK(written == pq_sz);
+        CHECK(nanovec_pq_deserialize(pq_buf, pq_sz, &pq_dst) == NANOVEC_SUCCESS);
+        CHECK(pq_dst.trained && pq_dst.owns_centroids);
+        CHECK(pq_dst.dim == pq_src.dim && pq_dst.m == pq_src.m && pq_dst.sub_dim == pq_src.sub_dim);
+        CHECK(memcmp(
+            pq_dst.centroids,
+            pq_src.centroids,
+            nanovec_pq_codebook_floats(&pq_src) * sizeof(float)
+        ) == 0);
+
+        CHECK(nanovec_pq_attach_mmap(pq_buf, pq_sz, &pq_mmap) == NANOVEC_SUCCESS);
+        CHECK(pq_mmap.trained && !pq_mmap.owns_centroids);
+        CHECK((const void *)pq_mmap.centroids == (const void *)(pq_buf + 64));
+
+        uint8_t p1[TEST_PQ_M], p2[TEST_PQ_M], p3[TEST_PQ_M];
+        CHECK(nanovec_pq_encode(&pq_src, query, p1) == NANOVEC_SUCCESS);
+        CHECK(nanovec_pq_encode(&pq_dst, query, p2) == NANOVEC_SUCCESS);
+        CHECK(nanovec_pq_encode(&pq_mmap, query, p3) == NANOVEC_SUCCESS);
+        CHECK(memcmp(p1, p2, TEST_PQ_M) == 0 && memcmp(p1, p3, TEST_PQ_M) == 0);
+
+        /* PQ corruption checks */
+        CHECK(nanovec_pq_deserialize(pq_buf, pq_sz - 4U, &pq_dst) == NANOVEC_ERR_CORRUPT);
+        pq_buf[3] = 'Z';
+        CHECK(nanovec_pq_deserialize(pq_buf, pq_sz, &pq_dst) == NANOVEC_ERR_CORRUPT);
+        pq_buf[3] = 'Q';
+        nanovec_write_le16(pq_buf + 4, 2);
+        CHECK(nanovec_pq_deserialize(pq_buf, pq_sz, &pq_dst) == NANOVEC_ERR_VERSION);
+        nanovec_write_le16(pq_buf + 4, 1);
+        nanovec_write_f32_le(pq_buf + 64, NAN);
+        nanovec_pq_t pq_bad;
+        CHECK(nanovec_pq_deserialize(pq_buf, pq_sz, &pq_bad) == NANOVEC_ERR_CORRUPT);
+
+        nanovec_pq_destroy(&pq_mmap);
+        nanovec_pq_destroy(&pq_dst);
+        nanovec_pq_destroy(&pq_src);
+        nanovec_aligned_free(pq_buf);
+        (void)printf("  [Persist    ] SQ8 (%zu B) & PQ (%zu B) round-trip + mmap overlay OK\n",
+                     sq_sz, pq_sz);
+    }
+
     nanovec_aligned_free(vecs);
     nanovec_aligned_free(recon);
     nanovec_aligned_free(query);

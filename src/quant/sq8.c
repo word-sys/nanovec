@@ -548,3 +548,150 @@ float nanovec_sq8_dist_l2(const nanovec_sq8_t *sq, const float *query, const uin
     }
     return ((s0 + s1) + (s2 + s3)) + tail;
 }
+
+#define NANOVEC_SQ8_SERIAL_HDR     64U
+#define NANOVEC_SQ8_SERIAL_VERSION 1U
+#define NANOVEC_SQ8_FLAG_TRAINED   (1U << 0)
+#define NANOVEC_SQ8_FLAG_PER_DIM   (1U << 1)
+
+size_t nanovec_sq8_serialized_size(uint16_t dim) {
+    if (dim == 0) {
+        return 0U;
+    }
+    size_t vec_aligned = nanovec_align_up((size_t)dim * sizeof(float), NANOVEC_CACHE_LINE);
+    return NANOVEC_SQ8_SERIAL_HDR + 2U * vec_aligned;
+}
+
+nanovec_status_t nanovec_sq8_serialize(
+    const nanovec_sq8_t *sq,
+    void                *out_buf,
+    size_t               buf_cap,
+    size_t              *out_written
+) {
+    if (NANOVEC_UNLIKELY(
+            sq == NULL || !sq->trained || !sq->min_val || !sq->max_val || out_buf == NULL
+        )) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "sq8_serialize requires trained sq and non-null out_buf"
+        );
+    }
+
+    size_t total = nanovec_sq8_serialized_size(sq->dim);
+    if (NANOVEC_UNLIKELY(buf_cap < total)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "sq8_serialize buffer too small (%zu < %zu)",
+            buf_cap,
+            total
+        );
+    }
+
+    uint8_t *dst = (uint8_t *)out_buf;
+    memset(dst, 0, total);
+    dst[0] = 'N';
+    dst[1] = 'V';
+    dst[2] = 'S';
+    dst[3] = 'Q';
+    uint16_t flags = (uint16_t)(NANOVEC_SQ8_FLAG_TRAINED | (sq->per_dim ? NANOVEC_SQ8_FLAG_PER_DIM : 0U));
+    nanovec_write_le16(dst + 0x04, (uint16_t)NANOVEC_SQ8_SERIAL_VERSION);
+    nanovec_write_le16(dst + 0x06, sq->dim);
+    nanovec_write_le16(dst + 0x08, flags);
+
+    size_t vec_aligned = nanovec_align_up((size_t)sq->dim * sizeof(float), NANOVEC_CACHE_LINE);
+    uint8_t *min_dst   = dst + NANOVEC_SQ8_SERIAL_HDR;
+    uint8_t *max_dst   = min_dst + vec_aligned;
+
+    for (uint32_t d = 0; d < sq->dim; ++d) {
+        nanovec_write_f32_le(min_dst + (size_t)d * sizeof(float), sq->min_val[d]);
+        nanovec_write_f32_le(max_dst + (size_t)d * sizeof(float), sq->max_val[d]);
+    }
+
+    if (out_written != NULL) {
+        *out_written = total;
+    }
+    return NANOVEC_SUCCESS;
+}
+
+nanovec_status_t nanovec_sq8_deserialize(
+    const void    *buf,
+    size_t         buf_size,
+    nanovec_sq8_t *out_sq
+) {
+    if (NANOVEC_UNLIKELY(out_sq == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(NANOVEC_ERR_INVALID_ARG, "out_sq is null");
+    }
+
+    const uint8_t *src = (const uint8_t *)buf;
+    if (NANOVEC_UNLIKELY(src == NULL || buf_size < NANOVEC_SQ8_SERIAL_HDR)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_CORRUPT,
+            "sq8 metadata buffer truncated (%zu bytes)",
+            buf_size
+        );
+    }
+    if (NANOVEC_UNLIKELY(src[0] != 'N' || src[1] != 'V' || src[2] != 'S' || src[3] != 'Q')) {
+        return (nanovec_status_t)nanovec_set_error(NANOVEC_ERR_CORRUPT, "invalid sq8 metadata magic");
+    }
+
+    uint16_t ver = nanovec_read_le16(src + 0x04);
+    if (NANOVEC_UNLIKELY(ver != NANOVEC_SQ8_SERIAL_VERSION)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_VERSION,
+            "unsupported sq8 metadata version %u",
+            (unsigned)ver
+        );
+    }
+
+    uint16_t dim   = nanovec_read_le16(src + 0x06);
+    uint16_t flags = nanovec_read_le16(src + 0x08);
+    if (NANOVEC_UNLIKELY(dim == 0 || (flags & NANOVEC_SQ8_FLAG_TRAINED) == 0U)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_CORRUPT,
+            "corrupt sq8 metadata header (dim=%u flags=0x%x)",
+            (unsigned)dim,
+            (unsigned)flags
+        );
+    }
+
+    size_t required = nanovec_sq8_serialized_size(dim);
+    if (NANOVEC_UNLIKELY(buf_size < required)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_CORRUPT,
+            "sq8 metadata payload truncated (%zu < %zu)",
+            buf_size,
+            required
+        );
+    }
+
+    bool per_dim = (flags & NANOVEC_SQ8_FLAG_PER_DIM) != 0U;
+    nanovec_status_t st = nanovec_sq8_init(out_sq, dim, per_dim);
+    if (st != NANOVEC_SUCCESS) {
+        return st;
+    }
+
+    size_t vec_aligned   = nanovec_align_up((size_t)dim * sizeof(float), NANOVEC_CACHE_LINE);
+    const uint8_t *min_s = src + NANOVEC_SQ8_SERIAL_HDR;
+    const uint8_t *max_s = min_s + vec_aligned;
+
+    for (uint32_t d = 0; d < dim; ++d) {
+        float mn = nanovec_read_f32_le(min_s + (size_t)d * sizeof(float));
+        float mx = nanovec_read_f32_le(max_s + (size_t)d * sizeof(float));
+        if (NANOVEC_UNLIKELY(!isfinite(mn) || !isfinite(mx) || mn > mx)) {
+            nanovec_sq8_destroy(out_sq);
+            return (nanovec_status_t)nanovec_set_error(
+                NANOVEC_ERR_CORRUPT,
+                "corrupt sq8 bounds at dim=%u (min=%g max=%g)",
+                d,
+                (double)mn,
+                (double)mx
+            );
+        }
+        out_sq->min_val[d] = mn;
+        out_sq->max_val[d] = mx;
+    }
+
+    nanovec_sq8_compute_scales(out_sq);
+    out_sq->trained = true;
+    return NANOVEC_SUCCESS;
+}

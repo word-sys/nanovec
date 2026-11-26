@@ -14,6 +14,7 @@ typedef struct nanovec_pq {
     uint16_t sub_dim;
     uint16_t ksub;
     bool     trained;
+    bool     owns_centroids;
     float   *centroids; /* [m][256][sub_dim], 64-byte aligned */
 } nanovec_pq_t;
 
@@ -68,6 +69,24 @@ nanovec_status_t nanovec_pq_decode_batch(
     const uint8_t      *in_codes,
     float              *out_vecs,
     size_t              count
+);
+
+size_t           nanovec_pq_serialized_size(uint16_t dim);
+nanovec_status_t nanovec_pq_serialize(
+    const nanovec_pq_t *pq,
+    void               *out_buf,
+    size_t              buf_cap,
+    size_t             *out_written
+);
+nanovec_status_t nanovec_pq_deserialize(
+    const void   *buf,
+    size_t        buf_size,
+    nanovec_pq_t *out_pq
+);
+nanovec_status_t nanovec_pq_attach_mmap(
+    const void   *buf,
+    size_t        buf_size,
+    nanovec_pq_t *out_pq
 );
 
 #endif /* NANOVEC_QUANT_PQ_H */

@@ -74,4 +74,17 @@ float nanovec_sq8_dist_dot_prepared(const nanovec_sq8_query_t *q, const uint8_t 
 float nanovec_sq8_dist_dot(const nanovec_sq8_t *sq, const float *query, const uint8_t *code);
 float nanovec_sq8_dist_l2(const nanovec_sq8_t *sq, const float *query, const uint8_t *code);
 
+size_t           nanovec_sq8_serialized_size(uint16_t dim);
+nanovec_status_t nanovec_sq8_serialize(
+    const nanovec_sq8_t *sq,
+    void                *out_buf,
+    size_t               buf_cap,
+    size_t              *out_written
+);
+nanovec_status_t nanovec_sq8_deserialize(
+    const void    *buf,
+    size_t         buf_size,
+    nanovec_sq8_t *out_sq
+);
+
 #endif /* NANOVEC_QUANT_SQ8_H */
