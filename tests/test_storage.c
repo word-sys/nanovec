@@ -749,6 +749,141 @@ static void test_dynamic_growth_mremap(void) {
     CHECK(unlink(path) == 0);
 }
 
+typedef struct seqlock_reader_ctx {
+    const nanovec_mmap_header_state_t *state;
+    _Atomic bool                      *stop;
+    uint64_t                           reads;
+} seqlock_reader_ctx_t;
+
+static void *seqlock_reader_fn(void *arg) {
+    seqlock_reader_ctx_t *ctx      = (seqlock_reader_ctx_t *)arg;
+    uint64_t              prev_k   = 0ULL;
+    uint64_t              prev_seq = 0ULL;
+
+    while (!atomic_load_explicit(ctx->stop, memory_order_acquire)) {
+        nanovec_header_snapshot_t snap;
+        CHECK(nanovec_mmap_header_read_snapshot(ctx->state, &snap) == NANOVEC_SUCCESS);
+        CHECK((snap.sequence & 1ULL) == 0ULL);
+        CHECK(snap.sequence >= prev_seq);
+        prev_seq = snap.sequence;
+
+        uint64_t k = snap.vector_count;
+        CHECK(k >= prev_k);
+        prev_k = k;
+
+        /* Verify all 6 fields obey the exact atomic invariant (zero torn reads). */
+        CHECK(snap.max_capacity == k * 2ULL + 16ULL);
+        CHECK(snap.vectors_offset == 128ULL + k * 64ULL);
+        CHECK(snap.quant_offset == 128ULL + k * 128ULL);
+        CHECK(snap.graph_offset == 128ULL + k * 192ULL);
+        CHECK(snap.metadata_offset == 128ULL + k * 256ULL);
+        ctx->reads++;
+    }
+    return NULL;
+}
+
+static void test_seqlock_header_concurrency(void) {
+    /* 1. Raw seqlock primitives: even -> odd -> even & retry detection. */
+    nanovec_seqlock_t sl;
+    nanovec_seqlock_init(&sl);
+    uint64_t s0 = nanovec_seqlock_read_begin(&sl);
+    CHECK(s0 == 0ULL);
+    CHECK(!nanovec_seqlock_read_retry(&sl, s0));
+
+    nanovec_seqlock_write_begin(&sl);
+    CHECK((atomic_load_explicit(&sl.seq, memory_order_relaxed) & 1ULL) == 1ULL);
+    nanovec_seqlock_write_end(&sl);
+    CHECK(nanovec_seqlock_read_retry(&sl, s0));
+
+    uint64_t s2 = nanovec_seqlock_read_begin(&sl);
+    CHECK(s2 == 2ULL);
+    CHECK(!nanovec_seqlock_read_retry(&sl, s2));
+
+    /* 2. .nvec mmap-backed header state initialization and publish + CRC verify. */
+    char path[256];
+    make_temp_path(path, sizeof(path), "seqlock");
+    (void)unlink(path);
+
+    nanovec_file_header_t init_hdr;
+    nanovec_header_init(&init_hdr, 32U, NANOVEC_METRIC_L2, NANOVEC_INDEX_FLAT, NANOVEC_QUANT_NONE, 16ULL);
+    init_hdr.vectors_offset  = nanovec_htole64(128ULL);
+    init_hdr.quant_offset    = nanovec_htole64(128ULL);
+    init_hdr.graph_offset    = nanovec_htole64(128ULL);
+    init_hdr.metadata_offset = nanovec_htole64(128ULL);
+
+    nanovec_mmap_t map;
+    CHECK(nanovec_mmap_open_nvec(path, &init_hdr, 4096U, false, true, &map) == NANOVEC_SUCCESS);
+
+    nanovec_mmap_header_state_t state;
+    CHECK(nanovec_mmap_header_state_init(&state, &map) == NANOVEC_SUCCESS);
+
+    nanovec_header_snapshot_t snap;
+    CHECK(nanovec_mmap_header_read_snapshot(&state, &snap) == NANOVEC_SUCCESS);
+    CHECK(snap.vector_count == 0ULL && snap.max_capacity == 16ULL);
+    CHECK(snap.vectors_offset == 128ULL && snap.metadata_offset == 128ULL);
+
+    /* 3. Concurrent 1-writer + 4-reader tear-free stress test (20,000 updates). */
+    _Atomic bool stop = false;
+    enum { NREADERS = 4, NUPDATES = 20000 };
+    pthread_t            readers[NREADERS];
+    seqlock_reader_ctx_t rctxs[NREADERS];
+
+    for (int i = 0; i < NREADERS; ++i) {
+        rctxs[i].state = &state;
+        rctxs[i].stop  = &stop;
+        rctxs[i].reads = 0ULL;
+        CHECK(pthread_create(&readers[i], NULL, seqlock_reader_fn, &rctxs[i]) == 0);
+    }
+
+    for (uint64_t k = 1ULL; k <= NUPDATES; ++k) {
+        nanovec_header_snapshot_t next;
+        next.vector_count    = k;
+        next.max_capacity    = k * 2ULL + 16ULL;
+        next.vectors_offset  = 128ULL + k * 64ULL;
+        next.quant_offset    = 128ULL + k * 128ULL;
+        next.graph_offset    = 128ULL + k * 192ULL;
+        next.metadata_offset = 128ULL + k * 256ULL;
+        next.sequence        = 0ULL;
+        /* Persist header updates to mmap every 1000 steps + final step. */
+        nanovec_mmap_t *target_map = ((k % 1000ULL) == 0ULL || k == NUPDATES) ? &map : NULL;
+        CHECK(nanovec_mmap_header_publish(&state, target_map, &next) == NANOVEC_SUCCESS);
+    }
+
+    atomic_store_explicit(&stop, true, memory_order_release);
+    uint64_t total_reads = 0ULL;
+    for (int i = 0; i < NREADERS; ++i) {
+        CHECK(pthread_join(readers[i], NULL) == 0);
+        CHECK(rctxs[i].reads > 0ULL);
+        total_reads += rctxs[i].reads;
+    }
+    CHECK(total_reads >= 4ULL);
+
+    /* Final snapshot and on-disk .nvec header must match and pass CRC-32C. */
+    CHECK(nanovec_mmap_header_read_snapshot(&state, &snap) == NANOVEC_SUCCESS);
+    CHECK(snap.vector_count == NUPDATES && snap.max_capacity == NUPDATES * 2ULL + 16ULL);
+    CHECK(snap.sequence == (uint64_t)NUPDATES * 2ULL);
+    CHECK(nanovec_header_verify(nanovec_mmap_header(&map)) == NANOVEC_SUCCESS);
+    CHECK(nanovec_le64toh(nanovec_mmap_header(&map)->vector_count) == NUPDATES);
+
+    /* publish_count fast path updates count/capacity and preserves offsets. */
+    CHECK(nanovec_mmap_header_publish_count(&state, &map, 424242ULL, 500000ULL) == NANOVEC_SUCCESS);
+    CHECK(nanovec_mmap_header_read_snapshot(&state, &snap) == NANOVEC_SUCCESS);
+    CHECK(snap.vector_count == 424242ULL && snap.max_capacity == 500000ULL);
+    CHECK(snap.vectors_offset == 128ULL + NUPDATES * 64ULL);
+    CHECK(nanovec_header_verify(nanovec_mmap_header(&map)) == NANOVEC_SUCCESS);
+
+    /* Defensive error checks. */
+    CHECK(nanovec_mmap_header_state_init(NULL, &map) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_mmap_header_read_snapshot(NULL, &snap) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_mmap_header_read_snapshot(&state, NULL) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_mmap_header_publish(&state, &map, NULL) == NANOVEC_ERR_INVALID_ARG);
+
+    nanovec_mmap_header_state_destroy(&state);
+    CHECK(nanovec_mmap_header_read_snapshot(&state, &snap) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_mmap_close(&map) == NANOVEC_SUCCESS);
+    CHECK(unlink(path) == 0);
+}
+
 int main(void) {
     test_header_and_checksum();
     test_file_io();
@@ -758,6 +893,7 @@ int main(void) {
     test_wal_concurrent_appends();
     test_wal_recover_and_crash_replay();
     test_dynamic_growth_mremap();
+    test_seqlock_header_concurrency();
     (void)printf("test_storage: ALL PASSED\n");
     return 0;
 }

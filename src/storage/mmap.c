@@ -407,3 +407,168 @@ nanovec_status_t nanovec_mmap_resident_pages(
     if (out_total != NULL)    *out_total    = total_pages;
     return NANOVEC_SUCCESS;
 }
+
+nanovec_status_t nanovec_mmap_header_state_init(
+    nanovec_mmap_header_state_t *state,
+    const nanovec_mmap_t        *map
+) {
+    if (NANOVEC_UNLIKELY(state == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "invalid header_state_init args"
+        );
+    }
+
+    memset(state, 0, sizeof(*state));
+    if (NANOVEC_UNLIKELY(pthread_mutex_init(&state->write_lock, NULL) != 0)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INTERNAL,
+            "header state mutex init failed"
+        );
+    }
+    state->lock_init = true;
+    nanovec_seqlock_init(&state->seqlock);
+
+    uint64_t vc = 0ULL, cap = 0ULL, voff = 0ULL, qoff = 0ULL, goff = 0ULL, moff = 0ULL;
+    const nanovec_file_header_t *hdr = (map != NULL) ? nanovec_mmap_header(map) : NULL;
+    if (hdr != NULL) {
+        vc   = nanovec_le64toh(hdr->vector_count);
+        cap  = nanovec_le64toh(hdr->max_capacity);
+        voff = nanovec_le64toh(hdr->vectors_offset);
+        qoff = nanovec_le64toh(hdr->quant_offset);
+        goff = nanovec_le64toh(hdr->graph_offset);
+        moff = nanovec_le64toh(hdr->metadata_offset);
+    }
+
+    atomic_init(&state->vector_count, vc);
+    atomic_init(&state->max_capacity, cap);
+    atomic_init(&state->vectors_offset, voff);
+    atomic_init(&state->quant_offset, qoff);
+    atomic_init(&state->graph_offset, goff);
+    atomic_init(&state->metadata_offset, moff);
+    return NANOVEC_SUCCESS;
+}
+
+void nanovec_mmap_header_state_destroy(nanovec_mmap_header_state_t *state) {
+    if (state == NULL) {
+        return;
+    }
+    if (state->lock_init) {
+        (void)pthread_mutex_destroy(&state->write_lock);
+        state->lock_init = false;
+    }
+    atomic_store_explicit(&state->seqlock.seq, 0ULL, memory_order_relaxed);
+}
+
+nanovec_status_t nanovec_mmap_header_read_snapshot(
+    const nanovec_mmap_header_state_t *state,
+    nanovec_header_snapshot_t         *out_snap
+) {
+    if (NANOVEC_UNLIKELY(state == NULL || !state->lock_init || out_snap == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "invalid header_read_snapshot args"
+        );
+    }
+
+    nanovec_header_snapshot_t snap;
+    uint64_t                  seq;
+    do {
+        seq                  = nanovec_seqlock_read_begin(&state->seqlock);
+        snap.vector_count    = atomic_load_explicit(&state->vector_count, memory_order_relaxed);
+        snap.max_capacity    = atomic_load_explicit(&state->max_capacity, memory_order_relaxed);
+        snap.vectors_offset  = atomic_load_explicit(&state->vectors_offset, memory_order_relaxed);
+        snap.quant_offset    = atomic_load_explicit(&state->quant_offset, memory_order_relaxed);
+        snap.graph_offset    = atomic_load_explicit(&state->graph_offset, memory_order_relaxed);
+        snap.metadata_offset = atomic_load_explicit(&state->metadata_offset, memory_order_relaxed);
+    } while (nanovec_seqlock_read_retry(&state->seqlock, seq));
+
+    snap.sequence = seq;
+    *out_snap     = snap;
+    return NANOVEC_SUCCESS;
+}
+
+nanovec_status_t nanovec_mmap_header_publish(
+    nanovec_mmap_header_state_t     *state,
+    nanovec_mmap_t                  *map,
+    const nanovec_header_snapshot_t *next
+) {
+    if (NANOVEC_UNLIKELY(state == NULL || !state->lock_init || next == NULL)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "invalid header_publish args"
+        );
+    }
+    if (NANOVEC_UNLIKELY(map != NULL && map->readonly)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "cannot publish header updates to read-only mapping"
+        );
+    }
+
+    (void)pthread_mutex_lock(&state->write_lock);
+
+    if (map != NULL) {
+        nanovec_file_header_t *hdr = nanovec_mmap_header(map);
+        if (hdr != NULL) {
+            hdr->vector_count    = nanovec_htole64(next->vector_count);
+            hdr->max_capacity    = nanovec_htole64(next->max_capacity);
+            hdr->vectors_offset  = nanovec_htole64(next->vectors_offset);
+            hdr->quant_offset    = nanovec_htole64(next->quant_offset);
+            hdr->graph_offset    = nanovec_htole64(next->graph_offset);
+            hdr->metadata_offset = nanovec_htole64(next->metadata_offset);
+            nanovec_header_seal(hdr);
+        }
+    }
+
+    nanovec_seqlock_write_begin(&state->seqlock);
+    atomic_store_explicit(&state->vector_count, next->vector_count, memory_order_relaxed);
+    atomic_store_explicit(&state->max_capacity, next->max_capacity, memory_order_relaxed);
+    atomic_store_explicit(&state->vectors_offset, next->vectors_offset, memory_order_relaxed);
+    atomic_store_explicit(&state->quant_offset, next->quant_offset, memory_order_relaxed);
+    atomic_store_explicit(&state->graph_offset, next->graph_offset, memory_order_relaxed);
+    atomic_store_explicit(&state->metadata_offset, next->metadata_offset, memory_order_relaxed);
+    nanovec_seqlock_write_end(&state->seqlock);
+
+    (void)pthread_mutex_unlock(&state->write_lock);
+    return NANOVEC_SUCCESS;
+}
+
+nanovec_status_t nanovec_mmap_header_publish_count(
+    nanovec_mmap_header_state_t *state,
+    nanovec_mmap_t              *map,
+    uint64_t                     vector_count,
+    uint64_t                     max_capacity
+) {
+    if (NANOVEC_UNLIKELY(state == NULL || !state->lock_init)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "invalid header_publish_count args"
+        );
+    }
+    if (NANOVEC_UNLIKELY(map != NULL && map->readonly)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "cannot publish header count to read-only mapping"
+        );
+    }
+
+    (void)pthread_mutex_lock(&state->write_lock);
+
+    if (map != NULL) {
+        nanovec_file_header_t *hdr = nanovec_mmap_header(map);
+        if (hdr != NULL) {
+            hdr->vector_count = nanovec_htole64(vector_count);
+            hdr->max_capacity = nanovec_htole64(max_capacity);
+            nanovec_header_seal(hdr);
+        }
+    }
+
+    nanovec_seqlock_write_begin(&state->seqlock);
+    atomic_store_explicit(&state->vector_count, vector_count, memory_order_relaxed);
+    atomic_store_explicit(&state->max_capacity, max_capacity, memory_order_relaxed);
+    nanovec_seqlock_write_end(&state->seqlock);
+
+    (void)pthread_mutex_unlock(&state->write_lock);
+    return NANOVEC_SUCCESS;
+}
