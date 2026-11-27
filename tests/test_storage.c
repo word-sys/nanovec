@@ -4,10 +4,12 @@
 #include "storage/checksum.h"
 #include "storage/file.h"
 #include "storage/format.h"
+#include "storage/growth.h"
 #include "storage/mmap.h"
 #include "storage/wal.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -600,6 +602,153 @@ static void test_wal_recover_and_crash_replay(void) {
     CHECK(unlink(path) == 0);
 }
 
+typedef struct growth_reader_ctx {
+    nanovec_growable_map_t *gmap;
+    _Atomic bool           *stop;
+    size_t                  vec_off;
+    size_t                  initial_bytes;
+    uint64_t                reads_done;
+} growth_reader_ctx_t;
+
+static void *growth_reader_fn(void *arg) {
+    growth_reader_ctx_t *ctx = (growth_reader_ctx_t *)arg;
+    uint64_t prev_gen = 0ULL;
+    while (!atomic_load_explicit(ctx->stop, memory_order_acquire)) {
+        nanovec_growth_ptrs_t p;
+        CHECK(nanovec_growth_read_lock(ctx->gmap, &p) == NANOVEC_SUCCESS);
+        CHECK(p.base != NULL && p.header != NULL && p.vectors != NULL);
+        CHECK(p.vectors == (void *)(p.base + ctx->vec_off));
+        CHECK(p.generation >= prev_gen);
+        prev_gen = p.generation;
+
+        const uint8_t *v = (const uint8_t *)p.vectors;
+        for (size_t i = 0U; i < ctx->initial_bytes; i += 64U) {
+            CHECK(v[i] == (uint8_t)((i * 29U + 7U) & 0xFFU));
+        }
+        nanovec_growth_read_unlock(ctx->gmap);
+        ctx->reads_done++;
+    }
+    return NULL;
+}
+
+static void test_dynamic_growth_mremap(void) {
+    char path[256];
+    make_temp_path(path, sizeof(path), "growth");
+    (void)unlink(path);
+
+    long   ps_raw    = sysconf(_SC_PAGESIZE);
+    size_t page_size = (ps_raw > 0) ? (size_t)ps_raw : NANOVEC_PAGE_SIZE;
+
+    /* Verify geometric growth size calculation. */
+    CHECK(nanovec_growth_calc_size(page_size, page_size, page_size) == page_size);
+    CHECK(nanovec_growth_calc_size(page_size, page_size + 1U, page_size) == 2U * page_size);
+    CHECK(nanovec_growth_calc_size(page_size, 5U * page_size, page_size) == 8U * page_size);
+
+    nanovec_file_header_t init_hdr;
+    nanovec_header_init(&init_hdr, 32U, NANOVEC_METRIC_L2, NANOVEC_INDEX_HNSW, NANOVEC_QUANT_NONE, 16ULL);
+    init_hdr.vectors_offset  = nanovec_htole64((uint64_t)page_size);
+    init_hdr.metadata_offset = nanovec_htole64(2ULL * (uint64_t)page_size);
+
+    nanovec_mmap_t map;
+    size_t init_size = 3U * page_size;
+    CHECK(nanovec_mmap_open_nvec(path, &init_hdr, init_size, false, true, &map) == NANOVEC_SUCCESS);
+
+    uint8_t *vecs = (uint8_t *)nanovec_mmap_vectors_ptr(&map);
+    CHECK(vecs != NULL);
+    for (size_t i = 0U; i < page_size; ++i) {
+        vecs[i] = (uint8_t)((i * 29U + 7U) & 0xFFU);
+    }
+
+    nanovec_growable_map_t gmap;
+    CHECK(nanovec_growth_init(&gmap, map) == NANOVEC_SUCCESS);
+
+    nanovec_growth_ptrs_t p0;
+    CHECK(nanovec_growth_read_lock(&gmap, &p0) == NANOVEC_SUCCESS);
+    CHECK(p0.mapped_len == init_size);
+    CHECK(p0.header != NULL && p0.vectors == (void *)(p0.base + page_size));
+    CHECK(p0.metadata == (void *)(p0.base + 2U * page_size));
+    CHECK(p0.generation == 1ULL);
+    nanovec_growth_read_unlock(&gmap);
+
+    /* Ensure capacity within current size is a no-op. */
+    bool grew = true;
+    CHECK(nanovec_growth_ensure_capacity(&gmap, init_size, &grew) == NANOVEC_SUCCESS);
+    CHECK(!grew);
+
+    /* Spawn 3 concurrent reader threads while writer performs multiple mremap growths up to 4 MiB. */
+    _Atomic bool stop_flag = false;
+    pthread_t           readers[3];
+    growth_reader_ctx_t rctxs[3];
+    for (int t = 0; t < 3; ++t) {
+        rctxs[t].gmap          = &gmap;
+        rctxs[t].stop          = &stop_flag;
+        rctxs[t].vec_off       = page_size;
+        rctxs[t].initial_bytes = page_size;
+        rctxs[t].reads_done    = 0ULL;
+        CHECK(pthread_create(&readers[t], NULL, growth_reader_fn, &rctxs[t]) == 0);
+    }
+
+    const size_t targets[4] = {
+        64U * 1024U,
+        256U * 1024U,
+        1024U * 1024U,
+        4U * 1024U * 1024U
+    };
+    for (int i = 0; i < 4; ++i) {
+        grew = false;
+        CHECK(nanovec_growth_ensure_capacity(&gmap, targets[i], &grew) == NANOVEC_SUCCESS);
+        CHECK(grew);
+
+        nanovec_growth_ptrs_t pi;
+        CHECK(nanovec_growth_read_lock(&gmap, &pi) == NANOVEC_SUCCESS);
+        CHECK(pi.mapped_len >= targets[i]);
+        CHECK(pi.header != NULL && nanovec_header_verify(pi.header) == NANOVEC_SUCCESS);
+        CHECK(pi.vectors == (void *)(pi.base + page_size));
+        CHECK(pi.metadata == (void *)(pi.base + 2U * page_size));
+        /* Touch the newly grown tail page to confirm no SIGBUS and zero-extension. */
+        CHECK(pi.base[pi.mapped_len - 1U] == 0U);
+        pi.base[pi.mapped_len - 1U] = (uint8_t)(0xA0 + i);
+        nanovec_growth_read_unlock(&gmap);
+    }
+
+    /* Exact growth while readers are active, then join readers before updating header offsets. */
+    size_t exact_target = gmap.map.mapped_len + 2U * page_size;
+    CHECK(nanovec_growth_grow_exact(&gmap, exact_target, NULL) == NANOVEC_SUCCESS);
+
+    atomic_store_explicit(&stop_flag, true, memory_order_release);
+    for (int t = 0; t < 3; ++t) {
+        CHECK(pthread_join(readers[t], NULL) == 0);
+        CHECK(rctxs[t].reads_done > 0ULL);
+    }
+
+    gmap.ptrs.header->graph_offset = nanovec_htole64((uint64_t)(exact_target - page_size));
+    nanovec_header_seal(gmap.ptrs.header);
+    CHECK(nanovec_growth_refresh_ptrs(&gmap) == NANOVEC_SUCCESS);
+
+    nanovec_growth_ptrs_t pf;
+    CHECK(nanovec_growth_read_lock(&gmap, &pf) == NANOVEC_SUCCESS);
+    CHECK(pf.mapped_len == exact_target);
+    CHECK(pf.graph == (void *)(pf.base + exact_target - page_size));
+    CHECK(nanovec_header_verify(pf.header) == NANOVEC_SUCCESS);
+    nanovec_growth_read_unlock(&gmap);
+
+    CHECK(nanovec_mmap_sync(&gmap.map, false) == NANOVEC_SUCCESS);
+    CHECK(nanovec_growth_destroy(&gmap) == NANOVEC_SUCCESS);
+
+    /* Reopen read-only: verify persisted grown size and rejection of growth on read-only map. */
+    CHECK(nanovec_mmap_open_nvec(path, NULL, 0U, true, false, &map) == NANOVEC_SUCCESS);
+    CHECK(map.mapped_len == exact_target);
+    CHECK(nanovec_mmap_grow(&map, exact_target + page_size, NULL) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_mmap_close(&map) == NANOVEC_SUCCESS);
+
+    /* Defensive error checks. */
+    CHECK(nanovec_mmap_grow(NULL, 4096U, NULL) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_growth_ensure_capacity(NULL, 4096U, NULL) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_growth_read_lock(NULL, &pf) == NANOVEC_ERR_INVALID_ARG);
+
+    CHECK(unlink(path) == 0);
+}
+
 int main(void) {
     test_header_and_checksum();
     test_file_io();
@@ -608,6 +757,7 @@ int main(void) {
     test_wal_append_and_reopen();
     test_wal_concurrent_appends();
     test_wal_recover_and_crash_replay();
+    test_dynamic_growth_mremap();
     (void)printf("test_storage: ALL PASSED\n");
     return 0;
 }
