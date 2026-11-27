@@ -411,3 +411,162 @@ nanovec_status_t nanovec_wal_sync(nanovec_wal_t *wal) {
     (void)pthread_mutex_unlock(&wal->lock);
     return st;
 }
+
+nanovec_status_t nanovec_wal_recover(
+    nanovec_wal_t                *wal,
+    nanovec_wal_replay_fn_t       replay_fn,
+    void                         *ctx,
+    nanovec_wal_recovery_stats_t *out_stats
+) {
+    if (NANOVEC_UNLIKELY(wal == NULL || !wal->lock_init || wal->file.fd < 0)) {
+        return (nanovec_status_t)nanovec_set_error(NANOVEC_ERR_INVALID_ARG, "invalid wal_recover handle");
+    }
+
+    (void)pthread_mutex_lock(&wal->lock);
+
+    uint64_t fsize = 0ULL;
+    nanovec_status_t st = nanovec_file_size(&wal->file, &fsize);
+    if (st != NANOVEC_SUCCESS) {
+        (void)pthread_mutex_unlock(&wal->lock);
+        return st;
+    }
+    if (NANOVEC_UNLIKELY(fsize < NANOVEC_WAL_HEADER_SIZE)) {
+        (void)pthread_mutex_unlock(&wal->lock);
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_WAL,
+            "WAL file shorter than 32-byte header during recovery"
+        );
+    }
+
+    nanovec_wal_file_header_t hdr;
+    st = nanovec_file_pread_exact(&wal->file, 0ULL, &hdr, sizeof(hdr));
+    if (st != NANOVEC_SUCCESS) {
+        (void)pthread_mutex_unlock(&wal->lock);
+        return st;
+    }
+
+    uint64_t ckpt_lsn = 0ULL;
+    st = nanovec_wal_hdr_verify(&hdr, &ckpt_lsn);
+    if (st != NANOVEC_SUCCESS) {
+        (void)pthread_mutex_unlock(&wal->lock);
+        return st;
+    }
+    wal->checkpoint_lsn = ckpt_lsn;
+
+    nanovec_wal_recovery_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    stats.last_valid_lsn   = ckpt_lsn;
+    stats.valid_end_offset = NANOVEC_WAL_HEADER_SIZE;
+
+    uint64_t pos         = NANOVEC_WAL_HEADER_SIZE;
+    uint64_t prev_lsn    = 0ULL;
+    uint64_t max_lsn     = ckpt_lsn;
+    uint8_t *scratch     = NULL;
+    size_t   scratch_cap = 0U;
+
+    while (pos < fsize) {
+        if (fsize - pos < NANOVEC_WAL_RECORD_HDR_SZ) {
+            stats.had_torn_tail = true;
+            break;
+        }
+
+        uint8_t raw_hdr[NANOVEC_WAL_RECORD_HDR_SZ];
+        st = nanovec_file_pread_exact(&wal->file, pos, raw_hdr, sizeof(raw_hdr));
+        if (st != NANOVEC_SUCCESS) {
+            nanovec_aligned_free(scratch);
+            (void)pthread_mutex_unlock(&wal->lock);
+            return st;
+        }
+
+        uint64_t lsn    = nanovec_read_le64(raw_hdr + 0x00);
+        uint8_t  op     = raw_hdr[0x08];
+        uint64_t vid    = nanovec_read_le64(raw_hdr + 0x0C);
+        uint32_t len    = nanovec_read_le32(raw_hdr + 0x14);
+        uint32_t stored = nanovec_read_le32(raw_hdr + 0x18);
+
+        if (lsn == 0ULL || (prev_lsn > 0ULL && lsn <= prev_lsn) ||
+            !nanovec_wal_op_valid(op) || len > NANOVEC_WAL_MAX_PAYLOAD) {
+            stats.had_torn_tail = true;
+            break;
+        }
+
+        uint64_t rec_total = (uint64_t)NANOVEC_WAL_RECORD_HDR_SZ + (uint64_t)len;
+        if (rec_total > fsize - pos) {
+            stats.had_torn_tail = true;
+            break;
+        }
+
+        if (len > scratch_cap) {
+            nanovec_aligned_free(scratch);
+            scratch_cap = nanovec_align_up((size_t)len, NANOVEC_CACHE_LINE);
+            scratch     = (uint8_t *)nanovec_aligned_alloc(NANOVEC_CACHE_LINE, scratch_cap);
+            if (NANOVEC_UNLIKELY(scratch == NULL)) {
+                (void)pthread_mutex_unlock(&wal->lock);
+                return NANOVEC_ERR_OOM;
+            }
+        }
+
+        if (len > 0U) {
+            st = nanovec_file_pread_exact(&wal->file, pos + NANOVEC_WAL_RECORD_HDR_SZ, scratch, len);
+            if (st != NANOVEC_SUCCESS) {
+                nanovec_aligned_free(scratch);
+                (void)pthread_mutex_unlock(&wal->lock);
+                return st;
+            }
+        }
+
+        uint32_t computed = nanovec_wal_record_crc(raw_hdr, scratch, len);
+        if (computed != stored) {
+            stats.had_torn_tail = true;
+            break;
+        }
+
+        stats.records_scanned++;
+        if (lsn <= ckpt_lsn) {
+            stats.records_skipped++;
+        } else if (replay_fn != NULL) {
+            const void *payload_ptr = (len > 0U) ? (const void *)scratch : NULL;
+            st = replay_fn((nanovec_wal_op_t)op, lsn, (nanovec_vid_t)vid, payload_ptr, len, ctx);
+            if (st != NANOVEC_SUCCESS) {
+                nanovec_aligned_free(scratch);
+                (void)pthread_mutex_unlock(&wal->lock);
+                return st;
+            }
+            stats.records_replayed++;
+        }
+
+        prev_lsn = lsn;
+        if (lsn > max_lsn) {
+            max_lsn = lsn;
+        }
+        pos += rec_total;
+    }
+
+    nanovec_aligned_free(scratch);
+
+    stats.last_valid_lsn   = max_lsn;
+    stats.valid_end_offset = pos;
+
+    if (pos < fsize) {
+        stats.had_torn_tail   = true;
+        stats.truncated_bytes = fsize - pos;
+        st = nanovec_file_truncate(&wal->file, pos);
+        if (st == NANOVEC_SUCCESS) {
+            st = nanovec_file_sync(&wal->file);
+        }
+        if (st != NANOVEC_SUCCESS) {
+            (void)pthread_mutex_unlock(&wal->lock);
+            return st;
+        }
+    }
+
+    wal->write_offset = pos;
+    wal->next_lsn     = max_lsn + 1ULL;
+
+    if (out_stats != NULL) {
+        *out_stats = stats;
+    }
+
+    (void)pthread_mutex_unlock(&wal->lock);
+    return NANOVEC_SUCCESS;
+}

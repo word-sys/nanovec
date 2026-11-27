@@ -108,4 +108,30 @@ nanovec_status_t nanovec_wal_checkpoint(nanovec_wal_t *wal, uint64_t checkpoint_
 nanovec_status_t nanovec_wal_truncate(nanovec_wal_t *wal, uint64_t checkpoint_lsn);
 nanovec_status_t nanovec_wal_sync(nanovec_wal_t *wal);
 
+typedef nanovec_status_t (*nanovec_wal_replay_fn_t)(
+    nanovec_wal_op_t op,
+    uint64_t         lsn,
+    nanovec_vid_t    vid,
+    const void      *payload,
+    uint32_t         len,
+    void            *ctx
+);
+
+typedef struct nanovec_wal_recovery_stats {
+    uint64_t records_scanned;
+    uint64_t records_replayed;
+    uint64_t records_skipped;
+    uint64_t last_valid_lsn;
+    uint64_t valid_end_offset;
+    uint64_t truncated_bytes;
+    bool     had_torn_tail;
+} nanovec_wal_recovery_stats_t;
+
+nanovec_status_t nanovec_wal_recover(
+    nanovec_wal_t                *wal,
+    nanovec_wal_replay_fn_t       replay_fn,
+    void                         *ctx,
+    nanovec_wal_recovery_stats_t *out_stats
+);
+
 #endif /* NANOVEC_STORAGE_WAL_H */

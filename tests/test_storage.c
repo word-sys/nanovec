@@ -407,6 +407,199 @@ static void test_wal_concurrent_appends(void) {
     CHECK(unlink(path) == 0);
 }
 
+typedef struct replay_state {
+    uint64_t         last_lsn;
+    uint32_t         call_count;
+    uint32_t         fail_on_call;
+    bool             present[16];
+    float            vecs[16][4];
+    char             meta[16][64];
+    uint32_t         big_len;
+    uint8_t          big_first;
+    uint8_t          big_last;
+} replay_state_t;
+
+static nanovec_status_t test_replay_cb(
+    nanovec_wal_op_t op,
+    uint64_t         lsn,
+    nanovec_vid_t    vid,
+    const void      *payload,
+    uint32_t         len,
+    void            *ctx
+) {
+    replay_state_t *st = (replay_state_t *)ctx;
+    st->call_count++;
+    if (st->fail_on_call > 0U && st->call_count == st->fail_on_call) {
+        return NANOVEC_ERR_OOM;
+    }
+    CHECK(lsn > st->last_lsn);
+    st->last_lsn = lsn;
+
+    if (vid == 15ULL && op == NANOVEC_WAL_OP_INSERT) {
+        CHECK(payload != NULL && len == 10000U);
+        const uint8_t *bytes = (const uint8_t *)payload;
+        st->big_len   = len;
+        st->big_first = bytes[0];
+        st->big_last  = bytes[len - 1U];
+        return NANOVEC_SUCCESS;
+    }
+
+    CHECK(vid < 16ULL);
+    switch (op) {
+        case NANOVEC_WAL_OP_INSERT:
+        case NANOVEC_WAL_OP_UPDATE:
+            CHECK(payload != NULL && len == 4U * sizeof(float));
+            memcpy(st->vecs[vid], payload, len);
+            st->present[vid] = true;
+            break;
+        case NANOVEC_WAL_OP_DELETE:
+            CHECK(payload == NULL && len == 0U);
+            st->present[vid] = false;
+            break;
+        case NANOVEC_WAL_OP_METADATA:
+            CHECK(payload != NULL && len > 0U && len < sizeof(st->meta[vid]));
+            memcpy(st->meta[vid], payload, len);
+            st->meta[vid][len] = '\0';
+            break;
+        case NANOVEC_WAL_OP_CHECKPOINT:
+            break;
+        default:
+            return NANOVEC_ERR_WAL;
+    }
+    return NANOVEC_SUCCESS;
+}
+
+static void test_wal_recover_and_crash_replay(void) {
+    char path[256];
+    make_temp_path(path, sizeof(path), "wal_recover");
+    (void)unlink(path);
+
+    /* 1. Empty WAL recovery succeeds cleanly. */
+    nanovec_wal_t wal;
+    nanovec_wal_recovery_stats_t stats;
+    CHECK(nanovec_wal_open(path, true, &wal) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_recover(&wal, test_replay_cb, NULL, &stats) == NANOVEC_SUCCESS);
+    CHECK(stats.records_scanned == 0ULL && stats.records_replayed == 0ULL);
+    CHECK(stats.records_skipped == 0ULL && stats.last_valid_lsn == 0ULL);
+    CHECK(stats.valid_end_offset == NANOVEC_WAL_HEADER_SIZE);
+    CHECK(!stats.had_torn_tail && stats.truncated_bytes == 0ULL);
+
+    /* 2. Write 6 records, checkpoint at LSN 2 so LSNs 1-2 are skipped and 3-6 replayed. */
+    float v1[4]  = {1.0f, 2.0f, 3.0f, 4.0f};
+    float v2[4]  = {10.0f, 20.0f, 30.0f, 40.0f};
+    float v2u[4] = {11.0f, 22.0f, 33.0f, 44.0f};
+    const char *m3 = "{\"tag\":\"recovered\"}";
+
+    uint64_t lsn = 0ULL;
+    CHECK(nanovec_wal_log_insert(&wal, 1ULL, v1, sizeof(v1), &lsn) == NANOVEC_SUCCESS && lsn == 1ULL);
+    CHECK(nanovec_wal_log_insert(&wal, 2ULL, v2, sizeof(v2), &lsn) == NANOVEC_SUCCESS && lsn == 2ULL);
+    CHECK(nanovec_wal_checkpoint(&wal, 2ULL) == NANOVEC_SUCCESS);
+
+    CHECK(nanovec_wal_log_update(&wal, 2ULL, v2u, sizeof(v2u), &lsn) == NANOVEC_SUCCESS && lsn == 3ULL);
+    CHECK(nanovec_wal_log_delete(&wal, 1ULL, &lsn) == NANOVEC_SUCCESS && lsn == 4ULL);
+    CHECK(nanovec_wal_log_metadata(&wal, 2ULL, m3, (uint32_t)strlen(m3), &lsn) == NANOVEC_SUCCESS && lsn == 5ULL);
+
+    uint8_t *big = (uint8_t *)malloc(10000U);
+    CHECK(big != NULL);
+    for (size_t i = 0U; i < 10000U; ++i) {
+        big[i] = (uint8_t)((i * 37U + 5U) & 0xFFU);
+    }
+    CHECK(nanovec_wal_log_insert(&wal, 15ULL, big, 10000U, &lsn) == NANOVEC_SUCCESS && lsn == 6ULL);
+    uint64_t clean_end = wal.write_offset;
+    CHECK(nanovec_wal_close(&wal) == NANOVEC_SUCCESS);
+
+    /* 3. Simulate crash with a torn partial record header (13 bytes) at EOF. */
+    nanovec_file_t rawf;
+    CHECK(nanovec_file_open(path, 0U, &rawf) == NANOVEC_SUCCESS);
+    const uint8_t torn_hdr[13] = {0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x09};
+    CHECK(nanovec_file_pwrite_exact(&rawf, clean_end, torn_hdr, sizeof(torn_hdr)) == NANOVEC_SUCCESS);
+    CHECK(nanovec_file_close(&rawf) == NANOVEC_SUCCESS);
+
+    /* 4. Callback error aborts recovery WITHOUT truncating the WAL so retry still works. */
+    CHECK(nanovec_wal_open(path, true, &wal) == NANOVEC_SUCCESS);
+    replay_state_t rstate;
+    memset(&rstate, 0, sizeof(rstate));
+    rstate.fail_on_call = 2U;
+    CHECK(nanovec_wal_recover(&wal, test_replay_cb, &rstate, &stats) == NANOVEC_ERR_OOM);
+    uint64_t fsz = 0ULL;
+    CHECK(nanovec_file_size(&wal.file, &fsz) == NANOVEC_SUCCESS);
+    CHECK(fsz == clean_end + sizeof(torn_hdr));
+
+    /* 5. Retry recovery: replays LSNs 3..6, skips 1..2, and truncates the 13B torn tail. */
+    memset(&rstate, 0, sizeof(rstate));
+    rstate.present[1] = true; /* pre-checkpoint state */
+    rstate.present[2] = true;
+    CHECK(nanovec_wal_recover(&wal, test_replay_cb, &rstate, &stats) == NANOVEC_SUCCESS);
+    CHECK(stats.records_scanned == 6ULL);
+    CHECK(stats.records_skipped == 2ULL);
+    CHECK(stats.records_replayed == 4ULL);
+    CHECK(stats.last_valid_lsn == 6ULL);
+    CHECK(stats.valid_end_offset == clean_end);
+    CHECK(stats.had_torn_tail && stats.truncated_bytes == sizeof(torn_hdr));
+
+    CHECK(!rstate.present[1]);
+    CHECK(rstate.present[2]);
+    CHECK(memcmp(rstate.vecs[2], v2u, sizeof(v2u)) == 0);
+    CHECK(strcmp(rstate.meta[2], m3) == 0);
+    CHECK(rstate.big_len == 10000U && rstate.big_first == big[0] && rstate.big_last == big[9999]);
+    free(big);
+
+    CHECK(nanovec_file_size(&wal.file, &fsz) == NANOVEC_SUCCESS);
+    CHECK(fsz == clean_end);
+    CHECK(wal.write_offset == clean_end && wal.next_lsn == 7ULL);
+
+    /* Second recovery pass on now-repaired WAL reports clean tail. */
+    CHECK(nanovec_wal_recover(&wal, NULL, NULL, &stats) == NANOVEC_SUCCESS);
+    CHECK(stats.records_scanned == 6ULL && stats.records_skipped == 2ULL && stats.records_replayed == 0ULL);
+    CHECK(!stats.had_torn_tail && stats.truncated_bytes == 0ULL);
+
+    /* 6. Append record 7, then corrupt its payload byte (CRC-32C mismatch) and recover. */
+    uint64_t before_rec7 = wal.write_offset;
+    CHECK(nanovec_wal_log_insert(&wal, 3ULL, v1, sizeof(v1), &lsn) == NANOVEC_SUCCESS && lsn == 7ULL);
+    uint64_t after_rec7 = wal.write_offset;
+    CHECK(nanovec_wal_close(&wal) == NANOVEC_SUCCESS);
+
+    CHECK(nanovec_file_open(path, 0U, &rawf) == NANOVEC_SUCCESS);
+    uint8_t flip = 0xAAU;
+    CHECK(nanovec_file_pwrite_exact(&rawf, before_rec7 + NANOVEC_WAL_RECORD_HDR_SZ + 4ULL, &flip, 1U) == NANOVEC_SUCCESS);
+    CHECK(nanovec_file_close(&rawf) == NANOVEC_SUCCESS);
+
+    CHECK(nanovec_wal_open(path, true, &wal) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_recover(&wal, NULL, NULL, &stats) == NANOVEC_SUCCESS);
+    CHECK(stats.records_scanned == 6ULL && stats.last_valid_lsn == 6ULL);
+    CHECK(stats.had_torn_tail && stats.truncated_bytes == (after_rec7 - before_rec7));
+    CHECK(wal.write_offset == before_rec7 && wal.next_lsn == 7ULL);
+
+    /* 7. Append a new valid record 7, then simulate torn payload (truncate mid-payload). */
+    CHECK(nanovec_wal_log_insert(&wal, 4ULL, v2, sizeof(v2), &lsn) == NANOVEC_SUCCESS && lsn == 7ULL);
+    CHECK(nanovec_wal_close(&wal) == NANOVEC_SUCCESS);
+
+    CHECK(nanovec_file_open(path, 0U, &rawf) == NANOVEC_SUCCESS);
+    CHECK(nanovec_file_truncate(&rawf, before_rec7 + NANOVEC_WAL_RECORD_HDR_SZ + 5ULL) == NANOVEC_SUCCESS);
+    CHECK(nanovec_file_close(&rawf) == NANOVEC_SUCCESS);
+
+    CHECK(nanovec_wal_open(path, true, &wal) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_recover(&wal, NULL, NULL, &stats) == NANOVEC_SUCCESS);
+    CHECK(stats.records_scanned == 6ULL && stats.had_torn_tail);
+    CHECK(stats.truncated_bytes == (uint64_t)NANOVEC_WAL_RECORD_HDR_SZ + 5ULL);
+    CHECK(wal.write_offset == before_rec7 && wal.next_lsn == 7ULL);
+
+    /* New append after recovery succeeds and persists cleanly. */
+    CHECK(nanovec_wal_log_insert(&wal, 5ULL, v1, sizeof(v1), &lsn) == NANOVEC_SUCCESS && lsn == 7ULL);
+    CHECK(nanovec_wal_close(&wal) == NANOVEC_SUCCESS);
+
+    CHECK(nanovec_wal_open(path, false, &wal) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_recover(&wal, NULL, NULL, &stats) == NANOVEC_SUCCESS);
+    CHECK(stats.records_scanned == 7ULL && stats.last_valid_lsn == 7ULL && !stats.had_torn_tail);
+    CHECK(nanovec_wal_close(&wal) == NANOVEC_SUCCESS);
+
+    /* Defensive error checks. */
+    CHECK(nanovec_wal_recover(NULL, NULL, NULL, &stats) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_wal_recover(&wal, NULL, NULL, &stats) == NANOVEC_ERR_INVALID_ARG);
+
+    CHECK(unlink(path) == 0);
+}
+
 int main(void) {
     test_header_and_checksum();
     test_file_io();
@@ -414,6 +607,7 @@ int main(void) {
     test_madvise_small_file();
     test_wal_append_and_reopen();
     test_wal_concurrent_appends();
+    test_wal_recover_and_crash_replay();
     (void)printf("test_storage: ALL PASSED\n");
     return 0;
 }
