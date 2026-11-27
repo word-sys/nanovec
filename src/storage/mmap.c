@@ -228,6 +228,68 @@ nanovec_status_t nanovec_mmap_close(nanovec_mmap_t *map) {
     return st;
 }
 
+static nanovec_status_t nanovec_mmap_validate_range(
+    const nanovec_mmap_t *map,
+    uint64_t              offset,
+    size_t                len,
+    const char           *op_name
+) {
+    if (NANOVEC_UNLIKELY(map == NULL || map->base == NULL || map->mapped_len == 0U)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "invalid %s handle",
+            op_name
+        );
+    }
+    if (NANOVEC_UNLIKELY(
+            offset > (uint64_t)map->mapped_len || len > map->mapped_len - (size_t)offset
+        )) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "%s range out of bounds",
+            op_name
+        );
+    }
+    return NANOVEC_SUCCESS;
+}
+
+static nanovec_status_t nanovec_madvise_apply(
+    const nanovec_mmap_t *map,
+    size_t                aligned_off,
+    size_t                aligned_len,
+    int                   advice,
+    const char           *op_name
+) {
+    if (NANOVEC_UNLIKELY(madvise(map->base + aligned_off, aligned_len, advice) != 0)) {
+        return (nanovec_status_t)nanovec_set_errno(
+            NANOVEC_ERR_MMAP,
+            errno,
+            "%s: madvise(%d) failed",
+            op_name,
+            advice
+        );
+    }
+    return NANOVEC_SUCCESS;
+}
+
+static nanovec_status_t nanovec_madvise_range(
+    const nanovec_mmap_t *map,
+    uint64_t              offset,
+    size_t                len,
+    int                   advice,
+    const char           *op_name
+) {
+    nanovec_status_t st = nanovec_mmap_validate_range(map, offset, len, op_name);
+    if (st != NANOVEC_SUCCESS || len == 0U) {
+        return st;
+    }
+
+    size_t ps          = nanovec_os_page_size();
+    size_t aligned_off = (size_t)offset & ~(ps - 1U);
+    size_t aligned_len = len + ((size_t)offset - aligned_off);
+    return nanovec_madvise_apply(map, aligned_off, aligned_len, advice, op_name);
+}
+
 nanovec_status_t nanovec_madvise_seq(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
     nanovec_status_t st = nanovec_mmap_validate_range(map, offset, len, "madvise_seq");
     if (st != NANOVEC_SUCCESS || len == 0U) {
@@ -343,104 +405,5 @@ nanovec_status_t nanovec_mmap_resident_pages(
 
     if (out_resident != NULL) *out_resident = resident;
     if (out_total != NULL)    *out_total    = total_pages;
-    return NANOVEC_SUCCESS;
-}
-
-static nanovec_status_t nanovec_madvise_apply(
-    const nanovec_mmap_t *map,
-    uint64_t              offset,
-    size_t                len,
-    int                   advice
-) {
-    if (NANOVEC_UNLIKELY(map == NULL || map->base == NULL || map->mapped_len == 0U)) {
-        return (nanovec_status_t)nanovec_set_error(NANOVEC_ERR_INVALID_ARG, "invalid madvise handle");
-    }
-
-    size_t start = 0U;
-    size_t span  = map->mapped_len;
-    if (offset != 0ULL || len != 0U) {
-        if (NANOVEC_UNLIKELY(
-                offset > (uint64_t)map->mapped_len || len > map->mapped_len - (size_t)offset
-            )) {
-            return (nanovec_status_t)nanovec_set_error(
-                NANOVEC_ERR_INVALID_ARG,
-                "madvise range out of bounds"
-            );
-        }
-        if (len == 0U) {
-            return NANOVEC_SUCCESS;
-        }
-        size_t ps = nanovec_os_page_size();
-        start = (size_t)offset & ~(ps - 1U);
-        span  = ((size_t)offset + len) - start;
-    }
-
-    if (NANOVEC_UNLIKELY(madvise(map->base + start, span, advice) != 0)) {
-        return (nanovec_status_t)nanovec_set_errno(NANOVEC_ERR_MMAP, errno, "madvise(%d) failed", advice);
-    }
-    return NANOVEC_SUCCESS;
-}
-
-nanovec_status_t nanovec_madvise_seq(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
-    nanovec_status_t st = nanovec_madvise_apply(map, offset, len, MADV_SEQUENTIAL);
-    if (st != NANOVEC_SUCCESS) {
-        return st;
-    }
-    return nanovec_madvise_apply(map, offset, len, MADV_WILLNEED);
-}
-
-nanovec_status_t nanovec_madvise_rand(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
-    return nanovec_madvise_apply(map, offset, len, MADV_RANDOM);
-}
-
-nanovec_status_t nanovec_madvise_normal(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
-    return nanovec_madvise_apply(map, offset, len, MADV_NORMAL);
-}
-
-nanovec_status_t nanovec_madvise_dontneed(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
-    if (NANOVEC_UNLIKELY(map == NULL || map->base == NULL || map->mapped_len == 0U)) {
-        return (nanovec_status_t)nanovec_set_error(
-            NANOVEC_ERR_INVALID_ARG,
-            "invalid madvise_dontneed handle"
-        );
-    }
-
-    size_t start = 0U;
-    size_t span  = map->mapped_len;
-    if (offset != 0ULL || len != 0U) {
-        if (NANOVEC_UNLIKELY(
-                offset > (uint64_t)map->mapped_len || len > map->mapped_len - (size_t)offset
-            )) {
-            return (nanovec_status_t)nanovec_set_error(
-                NANOVEC_ERR_INVALID_ARG,
-                "madvise_dontneed range out of bounds"
-            );
-        }
-        if (len == 0U) {
-            return NANOVEC_SUCCESS;
-        }
-        /* Evict only full interior pages to avoid touching adjacent hot pages (e.g. header). */
-        size_t ps  = nanovec_os_page_size();
-        size_t s   = nanovec_align_up((size_t)offset, ps);
-        size_t end = ((size_t)offset + len) & ~(ps - 1U);
-        if (end <= s) {
-            return NANOVEC_SUCCESS;
-        }
-        start = s;
-        span  = end - s;
-    }
-
-    if (NANOVEC_UNLIKELY(madvise(map->base + start, span, MADV_DONTNEED) != 0)) {
-        return (nanovec_status_t)nanovec_set_errno(
-            NANOVEC_ERR_MMAP,
-            errno,
-            "madvise(MADV_DONTNEED) failed"
-        );
-    }
-#ifdef POSIX_FADV_DONTNEED
-    if (map->file.fd >= 0) {
-        (void)posix_fadvise(map->file.fd, (off_t)start, (off_t)span, POSIX_FADV_DONTNEED);
-    }
-#endif
     return NANOVEC_SUCCESS;
 }

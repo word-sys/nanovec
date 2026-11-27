@@ -54,12 +54,6 @@ nanovec_status_t nanovec_mmap_resident_pages(
     size_t               *out_total
 );
 
-/* Passing offset=0, len=0 applies the paging hint to the entire mapped region. */
-nanovec_status_t nanovec_madvise_seq(const nanovec_mmap_t *map, uint64_t offset, size_t len);
-nanovec_status_t nanovec_madvise_rand(const nanovec_mmap_t *map, uint64_t offset, size_t len);
-nanovec_status_t nanovec_madvise_dontneed(const nanovec_mmap_t *map, uint64_t offset, size_t len);
-nanovec_status_t nanovec_madvise_normal(const nanovec_mmap_t *map, uint64_t offset, size_t len);
-
 static inline nanovec_file_header_t *nanovec_mmap_header(const nanovec_mmap_t *map) {
     if (NANOVEC_UNLIKELY(map == NULL || map->base == NULL || map->mapped_len < NANOVEC_HEADER_SIZE)) {
         return NULL;

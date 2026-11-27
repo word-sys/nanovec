@@ -5,7 +5,9 @@
 #include "storage/file.h"
 #include "storage/format.h"
 #include "storage/mmap.h"
+#include "storage/wal.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -210,11 +212,208 @@ static void test_madvise_small_file(void) {
     CHECK(unlink(path) == 0);
 }
 
+typedef struct wal_thread_ctx {
+    nanovec_wal_t *wal;
+    uint32_t       tid;
+    uint32_t       count;
+    uint64_t       lsns[64];
+} wal_thread_ctx_t;
+
+static void *wal_worker_fn(void *arg) {
+    wal_thread_ctx_t *ctx = (wal_thread_ctx_t *)arg;
+    float             vec[8];
+    for (uint32_t i = 0U; i < ctx->count; ++i) {
+        for (uint32_t d = 0U; d < 8U; ++d) {
+            vec[d] = (float)(ctx->tid * 100U + i) + 0.1f * (float)d;
+        }
+        uint64_t lsn = 0ULL;
+        nanovec_status_t st = nanovec_wal_log_insert(
+            ctx->wal,
+            ((uint64_t)ctx->tid << 32) | (uint64_t)i,
+            vec,
+            (uint32_t)sizeof(vec),
+            &lsn
+        );
+        CHECK(st == NANOVEC_SUCCESS);
+        ctx->lsns[i] = lsn;
+    }
+    return NULL;
+}
+
+static void test_wal_append_and_reopen(void) {
+    char path[256];
+    make_temp_path(path, sizeof(path), "wal_basic");
+    (void)unlink(path);
+
+    nanovec_wal_t wal;
+    CHECK(nanovec_wal_open(path, true, &wal) == NANOVEC_SUCCESS);
+    CHECK(wal.checkpoint_lsn == 0ULL);
+    CHECK(wal.next_lsn == 1ULL);
+    CHECK(wal.write_offset == NANOVEC_WAL_HEADER_SIZE);
+
+    /* Verify on-disk 32B header magic and CRC-32C. */
+    uint8_t raw_hdr[NANOVEC_WAL_HEADER_SIZE];
+    CHECK(nanovec_file_pread_exact(&wal.file, 0ULL, raw_hdr, sizeof(raw_hdr)) == NANOVEC_SUCCESS);
+    CHECK(raw_hdr[0] == 'N' && raw_hdr[1] == 'V' && raw_hdr[2] == 'W' && raw_hdr[3] == 'L');
+    CHECK(nanovec_read_le32(raw_hdr + 24) == nanovec_crc32c(raw_hdr, 24U));
+
+    /* Log insert, update, delete, metadata, and >8KiB large payload. */
+    float vec1[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float vec2[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+    const char *meta = "{\"title\":\"nanovec\"}";
+
+    uint64_t lsn1 = 0ULL, lsn2 = 0ULL, lsn3 = 0ULL, lsn4 = 0ULL, lsn5 = 0ULL;
+    CHECK(nanovec_wal_log_insert(&wal, 100ULL, vec1, (uint32_t)sizeof(vec1), &lsn1) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_log_update(&wal, 100ULL, vec2, (uint32_t)sizeof(vec2), &lsn2) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_log_delete(&wal, 100ULL, &lsn3) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_log_metadata(&wal, 101ULL, meta, (uint32_t)strlen(meta), &lsn4) == NANOVEC_SUCCESS);
+
+    uint8_t *big_payload = (uint8_t *)malloc(12000U);
+    CHECK(big_payload != NULL);
+    for (size_t i = 0U; i < 12000U; ++i) {
+        big_payload[i] = (uint8_t)((i * 73U + 19U) & 0xFFU);
+    }
+    CHECK(nanovec_wal_log_insert(&wal, 102ULL, big_payload, 12000U, &lsn5) == NANOVEC_SUCCESS);
+    free(big_payload);
+
+    CHECK(lsn1 == 1ULL && lsn2 == 2ULL && lsn3 == 3ULL && lsn4 == 4ULL && lsn5 == 5ULL);
+    uint64_t expected_off = NANOVEC_WAL_HEADER_SIZE
+        + (NANOVEC_WAL_RECORD_HDR_SZ + (uint64_t)sizeof(vec1))
+        + (NANOVEC_WAL_RECORD_HDR_SZ + (uint64_t)sizeof(vec2))
+        + (NANOVEC_WAL_RECORD_HDR_SZ + 0ULL)
+        + (NANOVEC_WAL_RECORD_HDR_SZ + (uint64_t)strlen(meta))
+        + (NANOVEC_WAL_RECORD_HDR_SZ + 12000ULL);
+    CHECK(wal.write_offset == expected_off);
+    CHECK(wal.next_lsn == 6ULL);
+
+    /* Inspect exact binary framing + CRC-32C of the first record. */
+    uint8_t rec1[NANOVEC_WAL_RECORD_HDR_SZ + 16U];
+    CHECK(nanovec_file_pread_exact(&wal.file, NANOVEC_WAL_HEADER_SIZE, rec1, sizeof(rec1)) == NANOVEC_SUCCESS);
+    CHECK(nanovec_read_le64(rec1 + 0x00) == 1ULL);
+    CHECK(rec1[0x08] == (uint8_t)NANOVEC_WAL_OP_INSERT);
+    CHECK(nanovec_read_le64(rec1 + 0x0C) == 100ULL);
+    CHECK(nanovec_read_le32(rec1 + 0x14) == 16U);
+    uint32_t rec1_crc = nanovec_crc32c_update(0U, rec1, 24U);
+    rec1_crc          = nanovec_crc32c_update(rec1_crc, rec1 + 28, 16U);
+    CHECK(nanovec_read_le32(rec1 + 0x18) == rec1_crc);
+    CHECK(memcmp(rec1 + 28, vec1, sizeof(vec1)) == 0);
+
+    /* Checkpoint advances monotonically; regression is rejected. */
+    CHECK(nanovec_wal_checkpoint(&wal, 3ULL) == NANOVEC_SUCCESS);
+    CHECK(wal.checkpoint_lsn == 3ULL);
+    CHECK(nanovec_wal_checkpoint(&wal, 2ULL) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_wal_sync(&wal) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_close(&wal) == NANOVEC_SUCCESS);
+
+    /* Append a simulated torn tail (corrupt bytes past last valid record), then reopen. */
+    nanovec_file_t rawf;
+    CHECK(nanovec_file_open(path, 0U, &rawf) == NANOVEC_SUCCESS);
+    const uint8_t torn[19] = {0xFF, 0x01, 0x02, 0x03, 0xAA, 0xBB, 0xCC, 0xDD};
+    CHECK(nanovec_file_pwrite_exact(&rawf, expected_off, torn, sizeof(torn)) == NANOVEC_SUCCESS);
+    CHECK(nanovec_file_close(&rawf) == NANOVEC_SUCCESS);
+
+    CHECK(nanovec_wal_open(path, true, &wal) == NANOVEC_SUCCESS);
+    CHECK(wal.checkpoint_lsn == 3ULL);
+    CHECK(wal.next_lsn == 6ULL);
+    CHECK(wal.write_offset == expected_off);
+
+    /* Truncate resets file back to 32B header and preserves monotonic LSNs. */
+    CHECK(nanovec_wal_truncate(&wal, 5ULL) == NANOVEC_SUCCESS);
+    CHECK(wal.checkpoint_lsn == 5ULL);
+    CHECK(wal.write_offset == NANOVEC_WAL_HEADER_SIZE);
+    CHECK(wal.next_lsn == 6ULL);
+    uint64_t fsz = 0ULL;
+    CHECK(nanovec_file_size(&wal.file, &fsz) == NANOVEC_SUCCESS);
+    CHECK(fsz == NANOVEC_WAL_HEADER_SIZE);
+
+    uint64_t lsn6 = 0ULL;
+    CHECK(nanovec_wal_log_delete(&wal, 999ULL, &lsn6) == NANOVEC_SUCCESS);
+    CHECK(lsn6 == 6ULL);
+
+    /* Defensive invalid-argument checks. */
+    CHECK(nanovec_wal_append(&wal, (nanovec_wal_op_t)0, 1ULL, NULL, 0U, NULL) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_wal_append(&wal, NANOVEC_WAL_OP_INSERT, 1ULL, NULL, 4U, NULL) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_wal_append(NULL, NANOVEC_WAL_OP_DELETE, 1ULL, NULL, 0U, NULL) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_wal_close(&wal) == NANOVEC_SUCCESS);
+
+    /* Reopen after truncate+append confirms persisted state. */
+    CHECK(nanovec_wal_open(path, false, &wal) == NANOVEC_SUCCESS);
+    CHECK(wal.checkpoint_lsn == 5ULL);
+    CHECK(wal.next_lsn == 7ULL);
+    CHECK(wal.write_offset == NANOVEC_WAL_HEADER_SIZE + NANOVEC_WAL_RECORD_HDR_SZ);
+    CHECK(nanovec_wal_close(&wal) == NANOVEC_SUCCESS);
+
+    /* Corrupt header magic and CRC must be rejected on open. */
+    CHECK(nanovec_file_open(path, 0U, &rawf) == NANOVEC_SUCCESS);
+    uint8_t bad_byte = 0x58U;
+    CHECK(nanovec_file_pwrite_exact(&rawf, 16ULL, &bad_byte, 1U) == NANOVEC_SUCCESS);
+    CHECK(nanovec_file_close(&rawf) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_open(path, false, &wal) == NANOVEC_ERR_WAL);
+
+    CHECK(nanovec_file_open(path, 0U, &rawf) == NANOVEC_SUCCESS);
+    CHECK(nanovec_file_pwrite_exact(&rawf, 0ULL, &bad_byte, 1U) == NANOVEC_SUCCESS);
+    CHECK(nanovec_file_close(&rawf) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_open(path, false, &wal) == NANOVEC_ERR_WAL);
+
+    CHECK(nanovec_file_open(path, 0U, &rawf) == NANOVEC_SUCCESS);
+    CHECK(nanovec_file_truncate(&rawf, 12ULL) == NANOVEC_SUCCESS);
+    CHECK(nanovec_file_close(&rawf) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_open(path, false, &wal) == NANOVEC_ERR_WAL);
+
+    CHECK(unlink(path) == 0);
+}
+
+static void test_wal_concurrent_appends(void) {
+    char path[256];
+    make_temp_path(path, sizeof(path), "wal_mt");
+    (void)unlink(path);
+
+    nanovec_wal_t wal;
+    CHECK(nanovec_wal_open(path, false, &wal) == NANOVEC_SUCCESS);
+
+    enum { NTHREADS = 4, PER_THREAD = 50, TOTAL = NTHREADS * PER_THREAD };
+    pthread_t        threads[NTHREADS];
+    wal_thread_ctx_t ctxs[NTHREADS];
+
+    for (uint32_t t = 0U; t < NTHREADS; ++t) {
+        ctxs[t].wal   = &wal;
+        ctxs[t].tid   = t;
+        ctxs[t].count = PER_THREAD;
+        CHECK(pthread_create(&threads[t], NULL, wal_worker_fn, &ctxs[t]) == 0);
+    }
+    for (uint32_t t = 0U; t < NTHREADS; ++t) {
+        CHECK(pthread_join(threads[t], NULL) == 0);
+    }
+
+    uint8_t seen[TOTAL + 1];
+    memset(seen, 0, sizeof(seen));
+    for (uint32_t t = 0U; t < NTHREADS; ++t) {
+        for (uint32_t i = 0U; i < PER_THREAD; ++i) {
+            uint64_t lsn = ctxs[t].lsns[i];
+            CHECK(lsn >= 1ULL && lsn <= (uint64_t)TOTAL);
+            CHECK(seen[lsn] == 0U);
+            seen[lsn] = 1U;
+        }
+    }
+    CHECK(wal.next_lsn == (uint64_t)TOTAL + 1ULL);
+    CHECK(nanovec_wal_sync(&wal) == NANOVEC_SUCCESS);
+    CHECK(nanovec_wal_close(&wal) == NANOVEC_SUCCESS);
+
+    /* Reopen and verify all 200 concurrent records verify intact via CRC-32C. */
+    CHECK(nanovec_wal_open(path, false, &wal) == NANOVEC_SUCCESS);
+    CHECK(wal.next_lsn == (uint64_t)TOTAL + 1ULL);
+    CHECK(wal.write_offset == NANOVEC_WAL_HEADER_SIZE + (uint64_t)TOTAL * (NANOVEC_WAL_RECORD_HDR_SZ + 32ULL));
+    CHECK(nanovec_wal_close(&wal) == NANOVEC_SUCCESS);
+    CHECK(unlink(path) == 0);
+}
+
 int main(void) {
     test_header_and_checksum();
     test_file_io();
     test_mmap_and_madvise();
     test_madvise_small_file();
+    test_wal_append_and_reopen();
+    test_wal_concurrent_appends();
     (void)printf("test_storage: ALL PASSED\n");
     return 0;
 }
