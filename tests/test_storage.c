@@ -5,6 +5,7 @@
 #include "storage/file.h"
 #include "storage/format.h"
 #include "storage/growth.h"
+#include "storage/metadata.h"
 #include "storage/mmap.h"
 #include "storage/wal.h"
 
@@ -884,6 +885,264 @@ static void test_seqlock_header_concurrency(void) {
     CHECK(unlink(path) == 0);
 }
 
+typedef struct meta_iter_ctx {
+    uint64_t sum_ids;
+    size_t   count;
+    size_t   stop_after;
+} meta_iter_ctx_t;
+
+static nanovec_status_t meta_iter_cb(
+    nanovec_vid_t id,
+    const void   *payload,
+    size_t        len,
+    void         *ctx
+) {
+    (void)payload;
+    (void)len;
+    meta_iter_ctx_t *mc = (meta_iter_ctx_t *)ctx;
+    mc->count++;
+    mc->sum_ids += id;
+    if (mc->stop_after > 0U && mc->count >= mc->stop_after) {
+        return NANOVEC_ERR_BUSY;
+    }
+    return NANOVEC_SUCCESS;
+}
+
+typedef struct meta_reader_ctx {
+    const nanovec_metadata_store_t *store;
+    _Atomic bool                   *stop;
+    uint64_t                        reads;
+} meta_reader_ctx_t;
+
+static void *meta_reader_fn(void *arg) {
+    meta_reader_ctx_t *ctx = (meta_reader_ctx_t *)arg;
+    char               buf[128];
+    while (!atomic_load_explicit(ctx->stop, memory_order_acquire)) {
+        size_t out_len = 0U;
+        nanovec_status_t st = nanovec_metadata_get(ctx->store, 100ULL, buf, sizeof(buf) - 1U, &out_len);
+        CHECK(st == NANOVEC_SUCCESS);
+        CHECK(out_len >= 6U && out_len < sizeof(buf));
+        buf[out_len] = '\0';
+        CHECK(strncmp(buf, "{\"v\":", 5) == 0);
+
+        /* Deleted key must stay absent, static key must stay intact. */
+        CHECK(nanovec_metadata_get(ctx->store, 999999ULL, buf, sizeof(buf), &out_len) == NANOVEC_ERR_NOT_FOUND);
+        st = nanovec_metadata_get(ctx->store, 1ULL, buf, sizeof(buf) - 1U, &out_len);
+        CHECK(st == NANOVEC_SUCCESS && out_len == strlen("static_doc") && memcmp(buf, "static_doc", out_len) == 0);
+        ctx->reads++;
+    }
+    return NULL;
+}
+
+static void test_metadata_store_and_nvec_persistence(void) {
+    nanovec_metadata_store_t store;
+    CHECK(nanovec_metadata_init(&store, 0U) == NANOVEC_SUCCESS);
+    CHECK(nanovec_metadata_count(&store) == 0U);
+
+    /* 1. Put JSON string, file path, text chunk, empty payload, and boundary VIDs (0, UINT64_MAX). */
+    const char *json0 = "{\"id\":0,\"source\":\"/var/data/doc0.txt\",\"chunk\":\"hello nanovec\"}";
+    const char *path1 = "/opt/corpus/embeddings/chunk_0042.md";
+    const char *text2 = "Zero-copy mmap vector metadata payload.";
+
+    CHECK(nanovec_metadata_put(&store, 0ULL, json0, strlen(json0)) == NANOVEC_SUCCESS);
+    CHECK(nanovec_metadata_put(&store, UINT64_MAX, path1, strlen(path1)) == NANOVEC_SUCCESS);
+    CHECK(nanovec_metadata_put(&store, 7ULL, text2, strlen(text2)) == NANOVEC_SUCCESS);
+    CHECK(nanovec_metadata_put(&store, 42ULL, NULL, 0U) == NANOVEC_SUCCESS);
+    CHECK(nanovec_metadata_count(&store) == 4U);
+    CHECK(nanovec_metadata_contains(&store, 42ULL));
+    CHECK(!nanovec_metadata_contains(&store, 123456ULL));
+
+    /* Size query and short-buffer handling. */
+    size_t out_len = 0U;
+    char   buf[256];
+    CHECK(nanovec_metadata_get(&store, 0ULL, NULL, 0U, &out_len) == NANOVEC_SUCCESS);
+    CHECK(out_len == strlen(json0));
+    CHECK(nanovec_metadata_get(&store, 0ULL, buf, 4U, &out_len) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(out_len == strlen(json0));
+    CHECK(nanovec_metadata_get(&store, 0ULL, buf, sizeof(buf), &out_len) == NANOVEC_SUCCESS);
+    CHECK(out_len == strlen(json0) && memcmp(buf, json0, out_len) == 0);
+
+    /* Empty 0-byte payload returns SUCCESS + out_len=0, distinct from NOT_FOUND. */
+    out_len = 999U;
+    CHECK(nanovec_metadata_get(&store, 42ULL, buf, sizeof(buf), &out_len) == NANOVEC_SUCCESS);
+    CHECK(out_len == 0U);
+    CHECK(nanovec_metadata_get(&store, 9999ULL, buf, sizeof(buf), &out_len) == NANOVEC_ERR_NOT_FOUND);
+    CHECK(out_len == 0U);
+
+    /* Zero-copy view matches contents. */
+    const void *view_ptr = NULL;
+    CHECK(nanovec_metadata_get_view(&store, UINT64_MAX, &view_ptr, &out_len) == NANOVEC_SUCCESS);
+    CHECK(out_len == strlen(path1) && memcmp(view_ptr, path1, out_len) == 0);
+
+    /* 2. Same-size in-place update + variable-size update + delete + compaction. */
+    const char *text2_same = "Updated-zero-copy-mmap-metadata-record!";
+    CHECK(strlen(text2_same) == strlen(text2));
+    size_t used_before = store.data_used;
+    CHECK(nanovec_metadata_put(&store, 7ULL, text2_same, strlen(text2_same)) == NANOVEC_SUCCESS);
+    CHECK(store.data_used == used_before); /* overwritten in-place */
+
+    const char *text2_longer = "Expanded payload exceeding prior record length with extra JSON metadata";
+    CHECK(nanovec_metadata_put(&store, 7ULL, text2_longer, strlen(text2_longer)) == NANOVEC_SUCCESS);
+    CHECK(store.dead_bytes > 0U);
+    CHECK(nanovec_metadata_delete(&store, 42ULL) == NANOVEC_SUCCESS);
+    CHECK(nanovec_metadata_delete(&store, 42ULL) == NANOVEC_ERR_NOT_FOUND);
+    CHECK(!nanovec_metadata_contains(&store, 42ULL));
+    CHECK(nanovec_metadata_count(&store) == 3U);
+
+    CHECK(nanovec_metadata_compact(&store) == NANOVEC_SUCCESS);
+    CHECK(store.dead_bytes == 0U);
+    CHECK(nanovec_metadata_get(&store, 7ULL, buf, sizeof(buf), &out_len) == NANOVEC_SUCCESS);
+    CHECK(out_len == strlen(text2_longer) && memcmp(buf, text2_longer, out_len) == 0);
+
+    /* Iteration (full & early stop). */
+    meta_iter_ctx_t mc = {0ULL, 0U, 0U};
+    CHECK(nanovec_metadata_iterate(&store, meta_iter_cb, &mc) == NANOVEC_SUCCESS);
+    CHECK(mc.count == 3U);
+    mc.count = 0U; mc.stop_after = 2U;
+    CHECK(nanovec_metadata_iterate(&store, meta_iter_cb, &mc) == NANOVEC_ERR_BUSY);
+    CHECK(mc.count == 2U);
+
+    /* 3. Rehash + auto-compaction stress across 300 keys and repeated updates. */
+    for (uint64_t k = 1000ULL; k < 1300ULL; ++k) {
+        char doc[96];
+        int  n = snprintf(doc, sizeof(doc), "{\"doc\":%llu,\"chunk\":\"segment-%llu\"}",
+                          (unsigned long long)k, (unsigned long long)(k * 3ULL));
+        CHECK(n > 0);
+        CHECK(nanovec_metadata_put(&store, k, doc, (size_t)n) == NANOVEC_SUCCESS);
+    }
+    for (uint64_t k = 1000ULL; k < 1150ULL; ++k) {
+        CHECK(nanovec_metadata_delete(&store, k) == NANOVEC_SUCCESS);
+    }
+    for (uint64_t k = 1150ULL; k < 1300ULL; ++k) {
+        char doc[128];
+        int  n = snprintf(doc, sizeof(doc), "{\"doc\":%llu,\"v\":2,\"text\":\"refreshed-chunk\"}",
+                          (unsigned long long)k);
+        CHECK(n > 0);
+        CHECK(nanovec_metadata_put(&store, k, doc, (size_t)n) == NANOVEC_SUCCESS);
+    }
+    CHECK(nanovec_metadata_count(&store) == 3U + 150U);
+
+    /* 4. Binary serialize + deserialize + corruption detection. */
+    size_t ser_need = nanovec_metadata_serialized_size(&store);
+    uint8_t *ser_buf = (uint8_t *)malloc(ser_need);
+    CHECK(ser_buf != NULL);
+    size_t ser_written = 0U;
+    CHECK(nanovec_metadata_serialize(&store, ser_buf, ser_need - 1U, &ser_written) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(ser_written == ser_need);
+    CHECK(nanovec_metadata_serialize(&store, ser_buf, ser_need, &ser_written) == NANOVEC_SUCCESS);
+    CHECK(ser_written == ser_need);
+    CHECK(ser_buf[0] == 'N' && ser_buf[1] == 'V' && ser_buf[2] == 'M' && ser_buf[3] == 'D');
+
+    nanovec_metadata_store_t restored;
+    CHECK(nanovec_metadata_deserialize(&restored, ser_buf, ser_need) == NANOVEC_SUCCESS);
+    CHECK(nanovec_metadata_count(&restored) == nanovec_metadata_count(&store));
+    CHECK(nanovec_metadata_get(&restored, 1299ULL, buf, sizeof(buf), &out_len) == NANOVEC_SUCCESS);
+    CHECK(memcmp(buf, "{\"doc\":1299,\"v\":2,\"text\":\"refreshed-chunk\"}", out_len) == 0);
+    nanovec_metadata_destroy(&restored);
+
+    /* Flip payload byte -> CRC-32C mismatch rejected. */
+    ser_buf[ser_need - 1U] ^= 0xFFU;
+    CHECK(nanovec_metadata_deserialize(&restored, ser_buf, ser_need) == NANOVEC_ERR_CORRUPT);
+    ser_buf[ser_need - 1U] ^= 0xFFU;
+    /* Flip header byte -> header CRC-32C mismatch rejected. */
+    ser_buf[10] ^= 0x01U;
+    CHECK(nanovec_metadata_deserialize(&restored, ser_buf, ser_need) == NANOVEC_ERR_CORRUPT);
+    free(ser_buf);
+
+    /* 5. Persist at end of .nvec file via growable mmap (triggers mremap) & attach read-only mmap zero-copy! */
+    char path[256];
+    make_temp_path(path, sizeof(path), "metadata_nvec");
+    (void)unlink(path);
+
+    nanovec_file_header_t init_hdr;
+    nanovec_header_init(&init_hdr, 32U, NANOVEC_METRIC_COSINE, NANOVEC_INDEX_FLAT, NANOVEC_QUANT_NONE, 16ULL);
+    init_hdr.vectors_offset = nanovec_htole64(128ULL);
+
+    nanovec_mmap_t map;
+    CHECK(nanovec_mmap_open_nvec(path, &init_hdr, 4096U, false, true, &map) == NANOVEC_SUCCESS);
+
+    nanovec_growable_map_t gmap;
+    CHECK(nanovec_growth_init(&gmap, map) == NANOVEC_SUCCESS);
+
+    /* Place metadata at aligned offset after vector payload area, triggering mremap growth past 4096B. */
+    uint64_t meta_off = 4096ULL;
+    size_t   sec_bytes = 0U;
+    CHECK(nanovec_metadata_persist_nvec(&store, &gmap, meta_off, &sec_bytes) == NANOVEC_SUCCESS);
+    CHECK(sec_bytes == ser_need);
+    CHECK(gmap.map.mapped_len >= (size_t)(meta_off + sec_bytes));
+    CHECK(gmap.ptrs.metadata == (void *)(gmap.ptrs.base + meta_off));
+    CHECK(nanovec_le64toh(gmap.ptrs.header->metadata_offset) == meta_off);
+    CHECK((nanovec_le16toh(gmap.ptrs.header->flags) & NANOVEC_HDR_FLAG_HAS_METADATA) != 0U);
+    CHECK(nanovec_header_verify(gmap.ptrs.header) == NANOVEC_SUCCESS);
+
+    CHECK(nanovec_mmap_sync(&gmap.map, false) == NANOVEC_SUCCESS);
+    CHECK(nanovec_growth_destroy(&gmap) == NANOVEC_SUCCESS);
+    nanovec_metadata_destroy(&store);
+
+    /* Reopen .nvec read-only and attach zero-copy directly onto mmap! */
+    CHECK(nanovec_mmap_open_nvec(path, NULL, 0U, true, false, &map) == NANOVEC_SUCCESS);
+    nanovec_metadata_store_t ro_store;
+    CHECK(nanovec_metadata_attach_mmap(&ro_store, &map) == NANOVEC_SUCCESS);
+    CHECK(ro_store.readonly);
+    CHECK(nanovec_metadata_count(&ro_store) == 153U);
+
+    CHECK(nanovec_metadata_get_view(&ro_store, 0ULL, &view_ptr, &out_len) == NANOVEC_SUCCESS);
+    CHECK(out_len == strlen(json0) && memcmp(view_ptr, json0, out_len) == 0);
+    CHECK((const uint8_t *)view_ptr >= map.base &&
+          (const uint8_t *)view_ptr + out_len <= map.base + map.mapped_len);
+
+    CHECK(nanovec_metadata_get(&ro_store, UINT64_MAX, buf, sizeof(buf), &out_len) == NANOVEC_SUCCESS);
+    CHECK(out_len == strlen(path1) && memcmp(buf, path1, out_len) == 0);
+
+    /* Mutations on read-only attached metadata store must be rejected. */
+    CHECK(nanovec_metadata_put(&ro_store, 5ULL, "x", 1U) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_metadata_delete(&ro_store, 0ULL) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_metadata_compact(&ro_store) == NANOVEC_ERR_INVALID_ARG);
+
+    nanovec_metadata_destroy(&ro_store);
+    CHECK(nanovec_mmap_close(&map) == NANOVEC_SUCCESS);
+    CHECK(unlink(path) == 0);
+
+    /* 6. Concurrent 1-writer + 3-reader metadata store stress test. */
+    CHECK(nanovec_metadata_init(&store, 128U) == NANOVEC_SUCCESS);
+    CHECK(nanovec_metadata_put(&store, 1ULL, "static_doc", 10U) == NANOVEC_SUCCESS);
+    CHECK(nanovec_metadata_put(&store, 100ULL, "{\"v\":0}", 7U) == NANOVEC_SUCCESS);
+
+    _Atomic bool      stop = false;
+    pthread_t         readers[3];
+    meta_reader_ctx_t rctxs[3];
+    for (int i = 0; i < 3; ++i) {
+        rctxs[i].store = &store;
+        rctxs[i].stop  = &stop;
+        rctxs[i].reads = 0ULL;
+        CHECK(pthread_create(&readers[i], NULL, meta_reader_fn, &rctxs[i]) == 0);
+    }
+
+    for (uint32_t iter = 1U; iter <= 1500U; ++iter) {
+        char val[64];
+        int  n = snprintf(val, sizeof(val), "{\"v\":%u,\"payload\":\"%s\"}",
+                          iter, (iter & 1U) ? "short" : "much-longer-variable-payload");
+        CHECK(n > 0);
+        CHECK(nanovec_metadata_put(&store, 100ULL, val, (size_t)n) == NANOVEC_SUCCESS);
+        CHECK(nanovec_metadata_put(&store, 10000ULL + iter, val, (size_t)n) == NANOVEC_SUCCESS);
+        if ((iter % 10U) == 0U) {
+            CHECK(nanovec_metadata_delete(&store, 10000ULL + iter - 5U) == NANOVEC_SUCCESS);
+        }
+    }
+
+    atomic_store_explicit(&stop, true, memory_order_release);
+    for (int i = 0; i < 3; ++i) {
+        CHECK(pthread_join(readers[i], NULL) == 0);
+        CHECK(rctxs[i].reads > 0ULL);
+    }
+
+    /* Defensive error checks. */
+    CHECK(nanovec_metadata_init(NULL, 64U) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_metadata_put(&store, 1ULL, NULL, 5U) == NANOVEC_ERR_INVALID_ARG);
+    CHECK(nanovec_metadata_get(&store, 1ULL, NULL, 10U, &out_len) == NANOVEC_ERR_INVALID_ARG);
+    nanovec_metadata_destroy(&store);
+}
+
 int main(void) {
     test_header_and_checksum();
     test_file_io();
@@ -894,6 +1153,7 @@ int main(void) {
     test_wal_recover_and_crash_replay();
     test_dynamic_growth_mremap();
     test_seqlock_header_concurrency();
+    test_metadata_store_and_nvec_persistence();
     (void)printf("test_storage: ALL PASSED\n");
     return 0;
 }
