@@ -6,6 +6,7 @@
 #include "storage/checksum.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -225,4 +226,221 @@ nanovec_status_t nanovec_mmap_close(nanovec_mmap_t *map) {
     memset(map, 0, sizeof(*map));
     map->file.fd = -1;
     return st;
+}
+
+nanovec_status_t nanovec_madvise_seq(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
+    nanovec_status_t st = nanovec_mmap_validate_range(map, offset, len, "madvise_seq");
+    if (st != NANOVEC_SUCCESS || len == 0U) {
+        return st;
+    }
+
+    size_t ps          = nanovec_os_page_size();
+    size_t aligned_off = (size_t)offset & ~(ps - 1U);
+    size_t aligned_len = len + ((size_t)offset - aligned_off);
+
+    st = nanovec_madvise_apply(map, aligned_off, aligned_len, MADV_SEQUENTIAL, "madvise_seq");
+    if (st != NANOVEC_SUCCESS) {
+        return st;
+    }
+    return nanovec_madvise_apply(map, aligned_off, aligned_len, MADV_WILLNEED, "madvise_seq");
+}
+
+nanovec_status_t nanovec_madvise_rand(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
+    return nanovec_madvise_range(map, offset, len, MADV_RANDOM, "madvise_rand");
+}
+
+nanovec_status_t nanovec_madvise_normal(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
+    return nanovec_madvise_range(map, offset, len, MADV_NORMAL, "madvise_normal");
+}
+
+nanovec_status_t nanovec_madvise_willneed(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
+    return nanovec_madvise_range(map, offset, len, MADV_WILLNEED, "madvise_willneed");
+}
+
+nanovec_status_t nanovec_madvise_dontneed(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
+    nanovec_status_t st = nanovec_mmap_validate_range(map, offset, len, "madvise_dontneed");
+    if (st != NANOVEC_SUCCESS || len == 0U) {
+        return st;
+    }
+
+    size_t ps        = nanovec_os_page_size();
+    size_t raw_start = (size_t)offset;
+    size_t raw_end   = raw_start + len;
+    if (raw_start > SIZE_MAX - (ps - 1U)) {
+        return NANOVEC_SUCCESS;
+    }
+
+    /* Shrink inward to full pages so adjacent hot data sharing a boundary page is not evicted. */
+    size_t start = (raw_start + (ps - 1U)) & ~(ps - 1U);
+    size_t end   = (raw_end == map->mapped_len) ? raw_end : (raw_end & ~(ps - 1U));
+    if (start >= end) {
+        return NANOVEC_SUCCESS;
+    }
+
+    size_t evict_len = end - start;
+    st = nanovec_madvise_apply(map, start, evict_len, MADV_DONTNEED, "madvise_dontneed");
+    if (st != NANOVEC_SUCCESS) {
+        return st;
+    }
+
+#if defined(__linux__) && defined(POSIX_FADV_DONTNEED)
+    if (map->file.fd >= 0 && (uint64_t)start <= (uint64_t)INT64_MAX &&
+        (uint64_t)evict_len <= (uint64_t)INT64_MAX - (uint64_t)start) {
+        (void)posix_fadvise(map->file.fd, (off_t)start, (off_t)evict_len, POSIX_FADV_DONTNEED);
+    }
+#endif
+    return NANOVEC_SUCCESS;
+}
+
+nanovec_status_t nanovec_mmap_resident_pages(
+    const nanovec_mmap_t *map,
+    uint64_t              offset,
+    size_t                len,
+    size_t               *out_resident,
+    size_t               *out_total
+) {
+    nanovec_status_t st = nanovec_mmap_validate_range(map, offset, len, "mmap_resident_pages");
+    if (st != NANOVEC_SUCCESS) {
+        return st;
+    }
+
+    if (len == 0U) {
+        if (out_resident != NULL) *out_resident = 0U;
+        if (out_total != NULL)    *out_total    = 0U;
+        return NANOVEC_SUCCESS;
+    }
+
+    size_t ps          = nanovec_os_page_size();
+    size_t aligned_off = (size_t)offset & ~(ps - 1U);
+    size_t span        = len + ((size_t)offset - aligned_off);
+    size_t total_pages = (span + (ps - 1U)) / ps;
+    size_t resident    = 0U;
+
+    unsigned char vec[1024];
+    size_t        done = 0U;
+    while (done < total_pages) {
+        size_t chunk_pages = total_pages - done;
+        if (chunk_pages > sizeof(vec)) {
+            chunk_pages = sizeof(vec);
+        }
+        size_t chunk_off   = aligned_off + done * ps;
+        size_t chunk_bytes = chunk_pages * ps;
+        if (chunk_bytes > map->mapped_len - chunk_off) {
+            chunk_bytes = map->mapped_len - chunk_off;
+        }
+        if (NANOVEC_UNLIKELY(mincore(map->base + chunk_off, chunk_bytes, vec) != 0)) {
+            return (nanovec_status_t)nanovec_set_errno(
+                NANOVEC_ERR_MMAP,
+                errno,
+                "mincore() failed"
+            );
+        }
+        for (size_t i = 0U; i < chunk_pages; ++i) {
+            resident += (size_t)(vec[i] & 1U);
+        }
+        done += chunk_pages;
+    }
+
+    if (out_resident != NULL) *out_resident = resident;
+    if (out_total != NULL)    *out_total    = total_pages;
+    return NANOVEC_SUCCESS;
+}
+
+static nanovec_status_t nanovec_madvise_apply(
+    const nanovec_mmap_t *map,
+    uint64_t              offset,
+    size_t                len,
+    int                   advice
+) {
+    if (NANOVEC_UNLIKELY(map == NULL || map->base == NULL || map->mapped_len == 0U)) {
+        return (nanovec_status_t)nanovec_set_error(NANOVEC_ERR_INVALID_ARG, "invalid madvise handle");
+    }
+
+    size_t start = 0U;
+    size_t span  = map->mapped_len;
+    if (offset != 0ULL || len != 0U) {
+        if (NANOVEC_UNLIKELY(
+                offset > (uint64_t)map->mapped_len || len > map->mapped_len - (size_t)offset
+            )) {
+            return (nanovec_status_t)nanovec_set_error(
+                NANOVEC_ERR_INVALID_ARG,
+                "madvise range out of bounds"
+            );
+        }
+        if (len == 0U) {
+            return NANOVEC_SUCCESS;
+        }
+        size_t ps = nanovec_os_page_size();
+        start = (size_t)offset & ~(ps - 1U);
+        span  = ((size_t)offset + len) - start;
+    }
+
+    if (NANOVEC_UNLIKELY(madvise(map->base + start, span, advice) != 0)) {
+        return (nanovec_status_t)nanovec_set_errno(NANOVEC_ERR_MMAP, errno, "madvise(%d) failed", advice);
+    }
+    return NANOVEC_SUCCESS;
+}
+
+nanovec_status_t nanovec_madvise_seq(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
+    nanovec_status_t st = nanovec_madvise_apply(map, offset, len, MADV_SEQUENTIAL);
+    if (st != NANOVEC_SUCCESS) {
+        return st;
+    }
+    return nanovec_madvise_apply(map, offset, len, MADV_WILLNEED);
+}
+
+nanovec_status_t nanovec_madvise_rand(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
+    return nanovec_madvise_apply(map, offset, len, MADV_RANDOM);
+}
+
+nanovec_status_t nanovec_madvise_normal(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
+    return nanovec_madvise_apply(map, offset, len, MADV_NORMAL);
+}
+
+nanovec_status_t nanovec_madvise_dontneed(const nanovec_mmap_t *map, uint64_t offset, size_t len) {
+    if (NANOVEC_UNLIKELY(map == NULL || map->base == NULL || map->mapped_len == 0U)) {
+        return (nanovec_status_t)nanovec_set_error(
+            NANOVEC_ERR_INVALID_ARG,
+            "invalid madvise_dontneed handle"
+        );
+    }
+
+    size_t start = 0U;
+    size_t span  = map->mapped_len;
+    if (offset != 0ULL || len != 0U) {
+        if (NANOVEC_UNLIKELY(
+                offset > (uint64_t)map->mapped_len || len > map->mapped_len - (size_t)offset
+            )) {
+            return (nanovec_status_t)nanovec_set_error(
+                NANOVEC_ERR_INVALID_ARG,
+                "madvise_dontneed range out of bounds"
+            );
+        }
+        if (len == 0U) {
+            return NANOVEC_SUCCESS;
+        }
+        /* Evict only full interior pages to avoid touching adjacent hot pages (e.g. header). */
+        size_t ps  = nanovec_os_page_size();
+        size_t s   = nanovec_align_up((size_t)offset, ps);
+        size_t end = ((size_t)offset + len) & ~(ps - 1U);
+        if (end <= s) {
+            return NANOVEC_SUCCESS;
+        }
+        start = s;
+        span  = end - s;
+    }
+
+    if (NANOVEC_UNLIKELY(madvise(map->base + start, span, MADV_DONTNEED) != 0)) {
+        return (nanovec_status_t)nanovec_set_errno(
+            NANOVEC_ERR_MMAP,
+            errno,
+            "madvise(MADV_DONTNEED) failed"
+        );
+    }
+#ifdef POSIX_FADV_DONTNEED
+    if (map->file.fd >= 0) {
+        (void)posix_fadvise(map->file.fd, (off_t)start, (off_t)span, POSIX_FADV_DONTNEED);
+    }
+#endif
+    return NANOVEC_SUCCESS;
 }
